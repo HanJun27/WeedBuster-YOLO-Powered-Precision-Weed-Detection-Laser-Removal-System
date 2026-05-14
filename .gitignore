@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+*.egg-info/
+dist/
+*.egg
+
+# YOLO训练输出
+runs/
+outputs/
+dataset/
+
+# 临时文件
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 视频和大文件
+*.mp4
+*.avi
+*.mov
+X5/
+temp_extract/
+
+# 其他无关文档
+*.zip
+*.exe
+md/
+视频/
+校准数据/
+总数据集/
+
+# Node modules (如果有)
+node_modules/
