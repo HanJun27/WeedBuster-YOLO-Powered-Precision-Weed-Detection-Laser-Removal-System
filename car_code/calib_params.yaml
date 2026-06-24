@@ -1,0 +1,13 @@
+burn_pos:
+- 313
+- 132
+calib1_done: true
+calib2_done: true
+calib2_frame: rgb
+delta_x: 56
+delta_y: -6
+shift_x: -10
+shift_y: -1
+spot_pos:
+- 257
+- 138
