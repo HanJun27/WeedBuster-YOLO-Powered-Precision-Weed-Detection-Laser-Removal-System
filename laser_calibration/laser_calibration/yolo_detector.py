@@ -359,7 +359,7 @@ class YoloDetectorNode(Node):
         # v3.10.13: ExG 物理光谱闸门 —— 拦截 YOLO 空锁假草(详见 config 注释)。
         #   在此统一过滤,BPU/CPU 两路都覆盖;bgr 即本帧原图。全被拦则 boxes 空,
         #   publish_timer 自然发 detected=False,下游从源头收不到假目标。
-        boxes = filter_boxes_by_exg(bgr, boxes, self.get_logger(), self._exg_enable)
+        boxes = filter_boxes_by_exg(bgr, boxes, self.get_logger())
 
         with self._lock:
             self._latest_boxes = boxes

@@ -1,394 +1,93 @@
-# WeedBuster - 智能杂草识别与激光除草系统
+# laser_calibration v3.11.1 —— 多目标鲁棒性 + 显示修复 + ExG 运行时开关
 
-<div align="center">
+> 基于 v3.11.0(已含负反馈新模型)。模型文件**未改**,仍是 mAP50=0.913、量化余弦 0.9991
+> 的新模型。本版**只改代码**,做三件事(均已离线自检 + 逻辑用例验证)。
 
-**基于YOLOv8 + ROS2 + BPU加速的低成本精准农业解决方案**
+## 三项改动
 
-[![Python](https://img.shields.io/badge/Python-3.8--3.11-blue.svg)](https://www.python.org/)
-[![ROS2](https://img.shields.io/badge/ROS2-Humble-green.svg)](https://docs.ros.org/en/humble/)
-[![YOLO](https://img.shields.io/badge/YOLO-v8-orange.svg)](https://github.com/ultralytics/ultralytics)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+### ① 身份核验式重捕获(解决"重打已打目标 / 抓旁株",顺带放宽门限)
+- 重捕获/跟踪选框时,把 planner 下发的**已打 + 其它待打**目标(中心参考系坐标)按 anchor
+  平移到当前画面得到各自预测位(eye-in-hand:相机+激光固定在云台,云台一转全场同量平移;
+  红斑+Δ 吸收盲跳残差)。
+- **anchor 附近唯一候选** → 收(除非它明显落在某个其它目标上 → 拒);
+  **多个候选都逼近 anchor(歧义)** → 用**共识平移**消歧:对每个候选设 e2=框−anchor,看该
+  e2 下其它目标预测位是否各有"另一个"框证实——正确框的 e2 能同时对齐全场,错框(如已打#1)
+  对不齐 → 选证实最多者;全无证实则**安全拒打**(不重打/误打)。
+- 重捕获门 `REACQ_MAX_DIST_PX` **50→70**:有身份核验兜底,放宽是安全的,解决孤立目标
+  "差点打到却因门限放弃"。
+- planner 同步:`strike_cmd` 新增 `others` 字段(本片其它待打目标坐标)。
+- **离线验证(关键)**:本版早期曾用"逐框最近预测"简单版,离线用例 **S1**(三目标:打完①去
+  打②、残差大使①的框逼近 anchor)复现了**它会误选已打①=重打**;故升级为共识平移版,S1 及
+  另外 4 个场景(孤立目标/遮挡/三目标/单目标片)全部通过。
+- 诚实边界:若当前目标本帧**被遮挡未检出**、且某已打目标恰好落到 anchor 附近、画面里又没有
+  其它框可旁证 —— 单帧视觉无法分辨,会退化(后果是**漏打**当前目标,不是危险动作)。根治靠
+  重标 PIXEL_TO_DEG/Δ 把残差压小。日常多目标(其它目标在画面里)已被共识版正确处理。
 
-</div>
+### ② 显示修复(蓝框/靶点框"跑出 YOLO 框"的观感问题)
+- 根因:v3.10.13/14 在"本帧无检测"时粗暴清空青框,**掀开了 yolo_target 的固有跟踪滞后**
+  (丢帧时蓝框钉在原地、草在滑动),显得"靶点跑出框"。打击本身不受影响(走红斑+PID 闭环)。
+- 改法:`detected=False` 不再清青框,**保留上一帧框作"上次检测"**,前端按年龄画:
+  **<0.25s 实线青 / 0.25~1.5s 虚线灰+"陈旧Xms" / >1.5s 不画**;**靶点框按新鲜度绿(新鲜)/灰(陈旧)**。
+  既不残留"看着像实时"的假框误导演示,也保留视觉参照,不再误判打偏。
+
+### ③ ExG 假草过滤运行时开关(前端→后端→话题整条接通)
+- yolo_detector 订阅 `/yolo/exg_enable`(Bool),`filter_boxes_by_exg(enable=...)` 即时生效;
+  vision_servo 8093 网页新增 **[ExG: 开/关]** 按钮 → 发布到该话题。**无需重启**即可现场
+  A/B 对比"开/关 ExG",并验证新模型是否真不空锁。初值仍取 config 的 `EXG_FILTER_ENABLE`。
 
 ---
 
-## 📋 项目简介
+## 模型文件(未改,供核对仍是新模型)
+| 文件 | md5 | 字节 |
+|---|---|---|
+| `models/quant.bin` | `b7690e8d48fca3ab961f6a291b0f3ca7` | 5,901,691 |
+| `models/best.pt` | `e292c0377724bf2c3c8bb01d5b9aa14a` | 6,268,388 |
+| `models/best.onnx` | `04e6b769d616f8ab16aa2fe15464e18e` | 12,266,036 |
+| `models/quant_info.json` | `2ad2520fd8fafa94d394318380efaf2c` | 72,639 |
 
-WeedBuster是一个完整的智能除草系统，结合深度学习目标检测、视觉伺服控制和多光谱成像技术，实现自动化杂草识别与激光物理清除。系统在亚博RDK X5边缘计算平台上运行，通过BPU硬件加速实现76 FPS实时推理，成本仅约¥300。
+---
 
-### 🎯 核心功能
-
-- **🔍 实时杂草检测**: YOLOv8n模型在RDK X5 BPU上实现76 FPS高速推理（27ms/帧），相比CPU提速67倍
-- **🎯 精准激光打击**: IBVS视觉伺服PID控制，±3像素精度定位，蓝紫激光（405nm）物理除草
-- **🌿 植物健康监测**: 850nm IR + RGB双目摄像头，支持active/reflection/pseudo三种NDVI计算模式
-- **⚡ 边缘端优化**: 模型量化压缩至3.2MB，支持地平线RDK X5平台高效部署
-
-### ✨ 技术特色
-
-- **双任务独立架构**: 激光除草与NDVI监测两条任务线并行运行，互不干扰
-- **解耦设计**: 图像采集、目标检测、伺服控制模块化，提升系统稳定性
-- **抗振荡PID算法**: 动态调整策略，有效避免云台抖动和饱和问题
-- **完整标定体系**: 四步标定流程（双目对齐→激光偏移→灰卡反射率→暗电流补偿）
-- **云端训练支持**: 提供数据集划分、断点续训、可视化评估完整工具链
-
-## 🏗️ 系统架构
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    任务A: 激光除草链路                        │
-│                                                             │
-│  stereo_camera (RGB 30fps) ──► yolo_detector (BPU 76 FPS)   │
-│         │                              │                     │
-│         │                      /yolo/weed_detected           │
-│         │                      (10Hz JSON + 心跳)            │
-│         │                              │                     │
-│         └──────────────────► vision_servo (IBVS PID)        │
-│                                        │                     │
-│                                        ▼                     │
-│                              S1/S2云台 + S3蓝紫激光          │
-└─────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────┐
-│                  任务B: NDVI健康监测链路                      │
-│                                                             │
-│  stereo_camera (RGB+IR)                                     │
-│         │                                                    │
-│         ▼                                                    │
-│  calib_diffuse (Web :8094)                                  │
-│   暗电流采样 + 灰卡ROI + 主动光场标定                        │
-│         │                                                    │
-│         ▼  (calib_params.yaml 增量更新)                      │
-│         │                                                    │
-│         ▼                                                    │
-│  ndvi_node (Web :8082)                                      │
-│   三阶段自适应: active/refl/pseudo NDVI                      │
-│   输出: /ndvi/image + /ndvi/result                          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-> 💡 **关键设计**: 两条任务线共用`stereo_camera`节点和`calib_io`模块，但执行流程完全独立，互不影响。
-
-## 📦 项目结构
-
-```
-WeedBuster/
-├── code/                      # ROS2激光校准包
-│   └── 总交接包_v3.10.0/
-│       ├── laser_calibration/ # ROS2 package (9个功能节点)
-│       │   ├── laser_calibration/  # Python模块
-│       │   ├── models/             # 模型文件
-│       │   ├── package.xml
-│       │   └── setup.py
-│       ├── servo_direction_test.py
-│       └── README_v3.10.0_交接.md
-├── 模型/                     # 训练完成的YOLOv8n权重
-│   ├── Best1/
-│   │   └── best.pt (~6MB)
-│   └── Best2/
-│       ├── best.pt (~6MB)
-│       └── training.log
-└── 量化后/                   # BPU量化模型及评估报告
-    └── X系列量化任务-61657045_all_results/
-        ├── quant.bin (~5.8MB)
-        ├── quant_model_quantized_model.onnx
-        └── quantization_result.json
-```
-
-## 🚀 快速开始
-
-### 1️⃣ 环境准备
-
-**硬件要求**:
-- 亚博RDK X5开发板（或兼容的地平线BPU平台）
-- RGB摄像头 + 850nm IR摄像头（双目配置）
-- S1/S2舵机云台 + S3蓝紫激光模块（405nm）
-
-**软件环境**:
-- Ubuntu 22.04 ARM64
-- ROS2 Humble Hawksbill
-- Python 3.8-3.11
-- PyTorch >= 1.8.0（训练用，可选CUDA）
-
-### 2️⃣ 安装依赖
+## 部署(本版改了代码,需标准重建;不能只换模型)
 
 ```bash
-# 基础依赖
-pip install ultralytics opencv-python numpy pyyaml
-
-# ROS2相关（在小车上）
-sudo apt install ros-humble-cv-bridge ros-humble-sensor-msgs
-```
-
-### 3️⃣ 模型推理（本地测试）
-
-```python
-from ultralytics import YOLO
-
-# 加载训练好的模型
-model = YOLO("模型/Best2/best.pt")
-
-# 单张图片预测
-results = model("test_image.jpg", conf=0.5)
-results[0].show()  # 显示检测结果
-
-# 批量预测
-results = model("dataset/images/val/", save=True)
-```
-
-### 4️⃣ ROS2部署（激光小车）
-
-#### 步骤1: 上传代码到小车
-
-```bash
-# 在本地电脑打包
-cd e:\GongZuoTai\YOLO\code
-tar -czf laser_calibration_v3_10_0.tar.gz 总交接包_v3.10.0/laser_calibration/
-
-# SCP上传到小车
-scp laser_calibration_v3_10_0.tar.gz sunrise@<小车IP>:~/
-```
-
-#### 步骤2: 在小车上解压和编译
-
-```bash
-# SSH连接小车
-ssh sunrise@<小车IP>
-
-# 解压到ROS2工作空间
-cd ~/yahboomcar_ws/src
-rm -rf laser_calibration
-tar -xzf ~/laser_calibration_v3_10_0.tar.gz
-mv 总交接包_v3.10.0/laser_calibration .
-
-# 验证文件结构
-ls laser_calibration/
-# 应看到: laser_calibration  models  package.xml  resource  setup.py
-
-# 编译ROS2包
-cd ~/yahboomcar_ws
+# 0) 清进程
+pkill -9 -f "stereo_camera|yolo_detector|vision_servo|strike_planner|chassis_controller|Mcnamu_driver|yahboom_keyboard"
+# 1) 解压
+cd /home/sunrise && unzip -o handover_v3.11.1.zip -d hv3111
+# 2) 替换源码包
+cd /home/sunrise/yahboomcar_ws/src && rm -rf laser_calibration
+unzip -o /home/sunrise/hv3111/laser_calibration_v3.11.1.zip
+# 3) 干净重建(不带 --symlink-install)
+cd /home/sunrise/yahboomcar_ws
+find src/laser_calibration -name "*.egg-info" -exec rm -rf {} + 2>/dev/null
+rm -rf build/laser_calibration install/laser_calibration
 colcon build --packages-select laser_calibration
 source install/setup.bash
-
-# 验证9个entry points
-ls install/laser_calibration/lib/laser_calibration/
+# 4) 验证
+ros2 pkg executables laser_calibration | wc -l    # 应=12
+python3 -c "import laser_calibration; print(laser_calibration.__version__)"   # 应=3.11.1
+md5sum src/laser_calibration/models/quant.bin     # 应=b7690e8d48fca3ab961f6a291b0f3ca7
 ```
 
-#### 步骤3: 启动激光除草链路
+## 运行(同前;ExG 开关在 8093 网页)
+节点起停顺序不变:`Mcnamu_driver → stereo_camera → yolo_detector → vision_servo →
+strike_planner → chassis_controller`,每个终端先 `source ~/yahboomcar_ws/install/setup.bash`。
+触发:`/chassis/start` 发车、`/chassis/stop` 收工、`/safety_stop` 急停、
+`/planner/start_clearing` 台架单独清场。
 
-```bash
-# 终端1: 启动双目相机
-ros2 run laser_calibration stereo_camera
+## 上车后逐项验证本版三件事
+1. **ExG 开关**:打开 8093 网页 → 点 **[ExG]** 按钮,看它在"开/关"间切换;`yolo_detector` 终端
+   会打印 `[ExG] 运行时开关 → 开启/关闭`。**关掉 ExG**,镜头对空地/纯纸面 → boxes 应稳定为 0
+   (验证新模型本身不空锁,ExG 多余);对真草 → 正常框出。
+2. **显示**:故意让目标短暂离开/遮挡 → 青框应变**虚线灰 + "陈旧Xms"**(而非消失),靶点框变灰;
+   恢复检测后变回实线青/绿。不再出现"蓝框无端跑出框"的误判。
+3. **身份核验(多目标)**:摆 2~3 株靠近的纸草跑一圈清场,盯 `vision_servo` 终端:正常时打
+   `[REACQ] 锚点重捕获...`;若某帧候选与当前目标对不上会打 `[身份核验] ...不更新靶点`。
+   重点确认**不再出现"打完一株又回去打同一株"**。建议用 `analyze_strike_logs.py` 复核成功率/
+   是否有重复 id。
 
-# 终端2: 启动YOLO检测（自动使用BPU加速）
-ros2 run laser_calibration yolo_detector
-# 期望输出: "✅ BPU 模型加载成功" + inference ~27ms
-
-# 终端3: 启动视觉伺服控制
-ros2 run laser_calibration vision_servo
-```
-
-#### 步骤4: Web界面监控
-
-浏览器访问 `http://<小车IP>:8093` 查看：
-- YOLO检测框实时显示
-- 紫色十字（激光落点）朝蓝色框（杂草）收敛
-- BPU推理时间、FPS等性能指标
-- 新鲜度指示器（绿色=正常）
-
-### 5️⃣ NDVI健康监测（可选）
-
-```bash
-# 终端1: 复用stereo_camera
-# （已在上面启动）
-
-# 终端2: 启动NDVI标定节点
-ros2 run laser_calibration calib_diffuse
-# 浏览器访问 http://<IP>:8094 进行标定
-
-# 终端3: 启动NDVI推理节点
-ros2 run laser_calibration ndvi_node
-# 浏览器访问 http://<IP>:8082 查看NDVI图像
-```
-
-## 📊 性能指标
-
-| 指标 | 数值 | 说明 |
-|------|------|------|
-| **mAP@0.5** | ≥ 0.85 | 杂草检测精度 |
-| **BPU推理速度** | 27ms/帧 (76 FPS) | RDK X5硬件加速 |
-| **CPU推理速度** | 1800ms/帧 | 对比基准 |
-| **加速比** | 67× | BPU vs CPU |
-| **PID收敛精度** | ±3像素 | 视觉伺服控制 |
-| **模型大小（原始）** | 6.0 MB | YOLOv8n .pt格式 |
-| **模型大小（量化后）** | 3.2 MB | BPU quant.bin格式 |
-| **标定耗时** | ~5分钟 | 完整四步标定 |
-| **硬件成本** | ~¥300 | 不含摄像头 |
-| **功耗** | <10W | RDK X5典型功耗 |
-
-### 训练数据
-
-- **数据集**: 棉花田杂草图像（weed/crop两类）
-- **样本数量**: ~5000张标注图片
-- **数据增强**: Mosaic、MixUp、随机翻转、色彩抖动
-- **训练轮数**: 100 epochs
-- **优化器**: AdamW (lr=0.001)
-
-## 🔧 ROS2功能节点详解
-
-### laser_calibration Package (v3.10.0)
-
-| 节点名称 | 功能描述 | 端口/话题 |
-|---------|---------|----------|
-| **stereo_camera** | 双目相机驱动，同步采集RGB+IR图像 | `/camera/rgb/image_raw`<br>`/camera/ir/image_raw` |
-| **yolo_detector** | YOLOv8目标检测，支持BPU/CPU自动切换 | Sub: `/camera/rgb/image_raw`<br>Pub: `/yolo/weed_detected` (10Hz) |
-| **vision_servo** | IBVS视觉伺服PID控制，驱动云台追踪 | Sub: `/yolo/weed_detected`<br>Ctrl: S1/S2舵机 + S3激光 |
-| **calib_camera_align** | 标定一：双目摄像头内外参对齐 | Web UI交互式标定 |
-| **calib_laser_offset** | 标定二：激光落点偏移量校准 | Web UI + 白纸靶标 |
-| **calib_reflectance** | 标定三：灰卡反射率采样 | Web UI :8091 |
-| **calib_diffuse** | 标定四：暗电流+主动光场标定 | Web UI :8094 |
-| **ndvi_node** | NDVI植物健康指数计算与可视化 | Sub: RGB+IR图像<br>Pub: `/ndvi/image`, `/ndvi/result` |
-| **show_calib** | 标定参数查看与验证工具 | 命令行工具 |
-
-### 通信协议
-
-**YOLO检测消息格式** (`/yolo/weed_detected`):
-```json
-{
-  "timestamp": 1234567890.123,
-  "detections": [
-    {
-      "class": "weed",
-      "confidence": 0.94,
-      "bbox": [245, 312, 458, 523],  // [x1, y1, x2, y2]
-      "center": [351, 417]            // 用于IBVS控制
-    }
-  ],
-  "inference_time_ms": 27.3,
-  "heartbeat": true
-}
-```
-
-## 🎓 标定流程
-
-### 完整四步标定（首次部署必做）
-
-```mermaid
-graph LR
-    A[标定一<br>双目对齐] --> B[标定二<br>激光偏移]
-    B --> C[标定三<br>灰卡反射率]
-    C --> D[标定四<br>暗电流补偿]
-    D --> E[系统就绪]
-```
-
-1. **标定一：双目摄像头对齐** (`calib_camera_align`)
-   - 目的：计算RGB与IR摄像头的相对位姿
-   - 方法：棋盘格标定板，采集20+组图像对
-   - 输出：旋转矩阵R、平移向量T
-
-2. **标定二：激光偏移校准** (`calib_laser_offset`)
-   - 目的：确定激光落点与图像中心的像素偏移
-   - 方法：白纸靶标，手动调整使激光打在十字中心
-   - 输出：offset_x, offset_y（像素）
-
-3. **标定三：灰卡反射率** (`calib_reflectance`)
-   - 目的：建立NDVI计算的反射率基准
-   - 方法：18%灰卡放入画面，拖选ROI区域采样
-   - 输出：k_active系数（理论范围0.8-1.5）
-
-4. **标定四：暗电流补偿** (`calib_diffuse`)
-   - 目的：消除传感器暗电流噪声
-   - 方法：黑布遮盖摄像头，采样30帧暗电流
-   - 输出：dark_R, dark_NIR（理论值<10）
-
-> ⚠️ **注意**: NDVI功能需要完成标定三和标定四才能进入active mode，否则降级为pseudo NDVI兜底模式。
-
-## 🧪 测试与验证
-
-### 激光除草链路验证清单
-
-- [ ] BPU推理日志显示 "✅ BPU 模型加载成功"
-- [ ] 终端2 inference时间 < 50ms/帧
-- [ ] Web界面 :8093 YOLO新鲜度持续绿色
-- [ ] 测试A：紫色十字平滑收敛到蓝色框中心
-- [ ] 测试B：移动目标时紫色十字跟随（不卡顿）
-- [ ] 测试C：终端3无频繁"饱和警告"
-- [ ] 收敛后蓝紫激光自动开火1秒（白纸可见焦痕）
-
-### NDVI链路验证清单
-
-- [ ] calib_diffuse节点启动成功，Web :8094可访问
-- [ ] 完成标定四（暗电流 + 灰卡ROI）
-- [ ] ndvi_node显示 "active mode 已启用"
-- [ ] Web :8082显示彩色NDVI图像（红→黄→绿渐变）
-- [ ] 健康分级数据合理（绿叶显示healthy占比高）
-
-## 🛠️ 故障排查
-
-### 常见问题
-
-| 问题现象 | 可能原因 | 解决方案 |
-|---------|---------|----------|
-| BPU推理失败 | 模型未正确转换 | 检查models/quant.bin是否存在，重新运行BPU转换 |
-| colcon build报错 | setup.cfg缺失 | 参考交接文档§3.2补全setup.cfg |
-| PID振荡严重 | 参数未调优 | 检查config.py中PID参数，降低Kp/Ki |
-| NDVI数值全为0 | 标定未完成 | 完成标定三和标定四，或检查IR摄像头信号 |
-| 云台不响应 | 串口权限问题 | `sudo chmod 666 /dev/ttyUSB*` |
-| 推理速度慢 | 未使用BPU | 确认yolo_detector第一行输出包含"BPU 模型加载成功" |
-
-### 应急方案
-
-**如果BPU推理失败**：
-```python
-# yolo_detector.py会自动fallback到CPU模式
-# 此时需降低vision_servo的FSM_TICK_PERIOD_SEC到2.0秒
-```
-
-**如果NDVI集成失败**：
-- NDVI不通不影响激光除草演示
-- 演示视频可只展示激光除草部分（已实测稳定）
-- 策划书中NDVI部分标注"已实现完整架构，集成测试进行中"
-
-## 📚 相关文档
-
-- [ROS2部署详细指南](code/总交接包_v3.10.0/README_v3.10.0_交接.md) - 完整版交接文档
-- [BPU模型转换教程](code/总交接包_v3.10.0/laser_calibration/ONNX_CONVERSION_DETAILED.md) - ONNX转BPU格式
-- [YOLO队友交接技术指南](code/总交接包_v3.10.0/laser_calibration/YOLO队友交接技术指南.md) - 接口契约说明
-- [历史版本记录](code/总交接包_v3.10.0/历史_交接手册_v3.9.9.md) - v3.7至v3.9.9演化历程
-
-## 📝 许可证
-
-本项目采用 MIT License 开源协议。
-
-## 👥 开发团队
-
-**精准农业AI项目组**
-
-- YOLO检测与BPU优化
-- ROS2系统集成与控制
-- 多光谱成像与NDVI算法
-- 边缘端部署与性能调优
-
-## 🙏 致谢
-
-- [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics) - 优秀的目标检测框架
-- [Horizon Robotics RDK](https://developer.horizon.ai/) - 强大的边缘AI平台
-- [ROS2](https://docs.ros.org/) - 灵活的机器人操作系统
-
-## 📧 联系方式
-
-如有问题、建议或合作意向，欢迎联系！
-
-- **GitHub Issues**: [提交问题](https://github.com/HanJun27/WeedBuster-YOLO-Powered-Precision-Weed-Detection-Laser-Removal-System/issues)
-- **邮箱**: [2730098037@qq.com](mailto:2730098037@qq.com)
-
----
-
-<div align="center">
-
-**硬件平台**: 亚博RDK X5 · Ubuntu 22.04 ARM64 · ROS2 Humble  
-**核心技术**: YOLOv8 · BPU加速 · IBVS控制 · NDVI监测 · 双目视觉
-
-⭐ 如果这个项目对你有帮助，请给我们一个 Star！
-
-</div>
+## 可调参数(vision_servo.py 顶部)
+- `REACQ_MAX_DIST_PX = 70`(重捕获门,孤立目标放宽用)
+- `CONSENSUS_TOL_PX = 20`(共识平移证实容差;现场框抖大可略放宽)
+- `IDENTITY_MARGIN_PX = 15`(保留)
+- ExG 各阈值与默认开关仍在 `config.py` 顶部 `EXG_*` 段。

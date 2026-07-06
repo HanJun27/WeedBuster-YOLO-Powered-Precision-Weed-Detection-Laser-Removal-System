@@ -28,10 +28,10 @@ chassis_fsm.py —— 车控状态机(纯逻辑,无 ROS 依赖)  v0.1
 
 # ── 可调参数(现场调这里)─────────────────────────────────────────
 CRUISE_SPEED_MPS  = 0.10   # 巡航速度 m/s(键盘默认 0.2 的一半,作业速度宁慢勿快)
-STOP_VOTE_FRAMES  = 15      # 连续 N 个新帧检出 weed 才停车(防抖)
+STOP_VOTE_FRAMES  = 3      # 连续 N 个新帧检出 weed 才停车(防抖)
 BRAKE_SETTLE_SEC  = 0.5    # 刹停后等车身稳定再触发清场
 CLEAR_TIMEOUT_SEC = 90.0   # 清场等待上限;超时 = 下游挂死 → FAULT 停车
-BLIND_ROLL_SEC    = 4.0    # 清完后盲走时长(0.1m/s × 4s = 40cm,把刚清的片甩出侧视野)
+BLIND_ROLL_SEC    = 3.0    # 清完后盲走时长(0.1m/s × 3s = 30cm,把刚清的片甩出侧视野)
 
 # ── 状态常量 ─────────────────────────────────────────────────────
 ST_STANDBY    = "STANDBY"     # 上电默认:静止待命,等 /chassis/start
