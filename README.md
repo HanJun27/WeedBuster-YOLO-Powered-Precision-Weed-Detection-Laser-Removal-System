@@ -63,8 +63,9 @@ The system keeps working accurately although the camera itself moves with the gi
 
 Each target's center-reference coordinate $(u,v)$ is mapped **independently** to an absolute gimbal angle (coarse aiming). With centered angle $\theta_c$, laser-spot home $(u_0,v_0)$, degrees-per-pixel $k$ (calibrated), and spot-to-hit offset $\Delta=(\Delta u,\Delta v)$:
 
-$$\theta_{yaw}=\theta_{c,yaw}+\big((u-\Delta u)-u_0\big)\times k_{yaw}$$
-
+```math
+\theta_{yaw}=\theta_{c,yaw}+\big((u-\Delta u)-u_0\big)\times k_{yaw}
+```
 **Key property**: every jump is solved from the center reference frame in absolute terms — never incrementally from the previous target — so angular error **does not accumulate across targets**.
 
 ### 2.2 Laser-Spot Feedback Servoing
@@ -73,12 +74,14 @@ $$\theta_{yaw}=\theta_{c,yaw}+\big((u-\Delta u)-u_0\big)\times k_{yaw}$$
 
 Under Eye-in-Hand, the red aiming spot stays nearly fixed in the image. After the blind jump, the spot pixel $s=(s_x,s_y)$ is detected and the **anchor** (predicted hit point of the working laser = where the target should appear) is:
 
-$$\text{anchor}=s+\Delta$$
+```math
+\text{anchor}=s+\Delta
+```
+Among candidate weed boxes $\lbrace b_i \rbrace$ in the current frame, the target is the one nearest to the anchor within gate $R$:
 
-Among candidate weed boxes $\{b_i\}$ in the current frame, the target is the one nearest to the anchor within gate $R$:
-
-$$b^\*=\arg\min_i\lVert b_i-\text{anchor}\rVert_2,\quad \lVert b^\*-\text{anchor}\rVert\le R$$
-
+```math
+b^{*}=\arg\min_i\lVert b_i-\text{anchor}\rVert_2,\quad \lVert b^{*}-\text{anchor}\rVert\le R
+```
 **Only two coarse calibration constants, robust to calibration error**: the whole system calibrates just $k$ and $\Delta$ (rough values suffice) — no image Jacobian, no high-precision hand–eye extrinsics. Because the anchor is grounded in the **physically measured** spot position, residuals from calibration, gear backlash and servo quantization are **absorbed automatically**. This distinguishes the approach from classic IBVS that depends on an interaction matrix.
 
 Spot detection itself uses layered tests for field robustness: R−max(G,B) redness score → brightness gate (rejects dark-red soil) → morphological closing → area window + circularity filter (rejects elongated glare) → ROI hint for speed.
@@ -87,10 +90,11 @@ Spot detection itself uses layered tests for field robustness: R−max(G,B) redn
 
 > 📄 `laser_calibration/vision_servo.py` (selection) · `strike_planner.py` (sends struck/pending sets)
 
-With multiple targets and a moving camera, a candidate box near the anchor may actually be an **already-struck** weed. Let the current target's reference coordinate be $C_2$ and other targets (struck + pending) be $\{P_j\}$. The reference-to-current translation is $\tau=\text{anchor}-C_2$, giving predictions $P_j'=P_j+\tau$. When several candidates crowd the anchor, each candidate $b$ is hypothesized as the true target ($e_2=b-\text{anchor}$) and scored by how many *other* predictions are corroborated by a *different* detection within tolerance $\tau_0$:
+With multiple targets and a moving camera, a candidate box near the anchor may actually be an **already-struck** weed. Let the current target's reference coordinate be $C_2$ and other targets (struck + pending) be $\lbrace P_j \rbrace$. The reference-to-current translation is $\tau=\text{anchor}-C_2$, giving predictions $P_j'=P_j+\tau$. When several candidates crowd the anchor, each candidate $b$ is hypothesized as the true target ($e_2=b-\text{anchor}$) and scored by how many *other* predictions are corroborated by a *different* detection within tolerance $\tau_0$:
 
-$$\text{score}(b)=\#\{\,j:\exists\,b_k\ne b,\ \lVert b_k-(P_j'+e_2)\rVert\le \tau_0\,\}$$
-
+```math
+\mathrm{score}(b)=\bigl|\lbrace\, j : \exists\, b_k\ne b,\ \lVert b_k-(P_j'+e_2)\rVert\le \tau_0 \,\rbrace\bigr|
+```
 The highest-scoring candidate wins; if none is corroborated, the frame is safely rejected (no strike). **Why it works**: under Eye-in-Hand the whole scene shares one translation, so only the true target's $e_2$ aligns all other boxes simultaneously — a wrong candidate (e.g. an already-struck weed) cannot. Conceptually this is camera-motion compensation + data association from multi-object tracking. **Field-tested: it intercepted repeated strikes on cleared weeds.**
 
 ### 2.4 Quantization-Aware Servo Control
@@ -99,15 +103,16 @@ The highest-scoring candidate wins; if none is corroborated, the frame is safely
 
 The 1° PWM servos quantize motion; one degree spans $q=1/k\approx10\text{–}20$ px depending on working distance. The loop converts pixel error $e$ into integer-degree steps:
 
-$$\Delta\theta_{cmd}=\operatorname{round}(K_p\cdot k\cdot e)$$
-
+```math
+\Delta\theta_{cmd}=\mathrm{round}(K_p\cdot k\cdot e)
+```
 Locking criterion: **integer step = 0** (error below half a step), i.e. the gimbal settles on the best reachable grid point; the historical best is tracked and restored if no improvement persists. **Why**: the controller *acknowledges* the ~5 px quantization floor and stops once the laser can already hit, instead of oscillating between adjacent grid points — achieving pixel-level aiming near the physical limit of a cheap servo ("low-cost hardware + quantization-aware algorithm = high precision").
 
 ### 2.5 Multi-Target Planning
 
 > 📄 `laser_calibration/strike_planner.py`
 
-With the gimbal centered, detections are voted over multiple frames (filters single-frame false positives) to build the queue $\{T_i\}$ in reference coordinates; targets are sorted greedily by distance to minimize total gimbal travel; each dispatch carries the **struck set $S$** and **pending set $Q$** for identity checking; success commits $S\leftarrow S\cup\{T\}$, failure re-queues the target for retry. **This is the single decision entry of the system** — a single target is simply a queue of length 1 going through the same vote–queue–dispatch–commit flow (the web manual/auto triggers are development-only and disabled by default). When the queue empties, `patch_clear` releases the chassis.
+With the gimbal centered, detections are voted over multiple frames (filters single-frame false positives) to build the queue $\lbrace T_i \rbrace$ in reference coordinates; targets are sorted greedily by distance to minimize total gimbal travel; each dispatch carries the **struck set $S$** and **pending set $Q$** for identity checking; success commits $S\leftarrow S\cup\lbrace T \rbrace$, failure re-queues the target for retry. **This is the single decision entry of the system** — a single target is simply a queue of length 1 going through the same vote–queue–dispatch–commit flow (the web manual/auto triggers are development-only and disabled by default). When the queue empties, `patch_clear` releases the chassis.
 
 ### 2.6 NDVI with Vicarious Calibration
 
@@ -115,8 +120,9 @@ With the gimbal centered, detections are voted over multiple frames (filters sin
 
 Instead of naively plugging raw DN values into the formula, NDVI uses low-cost **vicarious calibration**: dark-current subtraction plus a PTFE diffuse-panel (gray-card) $K$ correction that brings the R / NIR channels onto one radiometric basis:
 
-$$NDVI=\frac{K\cdot NIR'-R'}{K\cdot NIR'+R'},\quad R'=DN_R-dark_R,\ \ K=\frac{R'_{gray}}{NIR'_{gray}}$$
-
+```math
+NDVI=\frac{K\cdot NIR'-R'}{K\cdot NIR'+R'},\quad R'=DN_R-dark_R,\ \ K=\frac{R'_{gray}}{NIR'_{gray}}
+```
 Three modes degrade automatically: ① active calibration (near-true NDVI) → ② reflectance-card calibration → ③ relative (pseudo) NDVI fallback. Distance/material effects cancel in the ratio; recalibrate when lighting changes.
 
 **Time-series growth monitoring**: relative NDVI is not comparable across devices, but is temporally consistent under "same device, same calibration, same field". The system therefore supports day-by-day acquisition over the same crops, using the **relative trend** for growth monitoring and stress early-warning — a sustained drop typically precedes visible yellowing, flagging disease or drought stress early. With the PTFE panel calibrated, near-true health grading is available. The robot thus works in a "**weed while you scout**" mode: every pass both clears weeds and checks crop health.

@@ -61,8 +61,9 @@
 
 将目标的中心参考坐标 $(u,v)$ 直接映射为云台**绝对角度**并一次转到位（粗对准）。设归中角 $\theta_c$、红斑基准位 $(u_0,v_0)$、每像素角度 $k$（标定量）、红斑到蓝光落点偏移 $\Delta=(\Delta u,\Delta v)$：
 
-$$\theta_{yaw}=\theta_{c,yaw}+\big((u-\Delta u)-u_0\big)\times k_{yaw}$$
-
+```math
+\theta_{yaw}=\theta_{c,yaw}+\big((u-\Delta u)-u_0\big)\times k_{yaw}
+```
 **关键**：每个目标都由其中心参考坐标**独立**解算绝对角，而非在上一目标基础上增量叠加，因此角度误差**不跨目标累积**——这是相对“增量式”方案的本质优势。
 
 ### 2.2 红斑反馈闭环重捕获　Laser-Spot Feedback Servoing
@@ -71,12 +72,14 @@ $$\theta_{yaw}=\theta_{c,yaw}+\big((u-\Delta u)-u_0\big)\times k_{yaw}$$
 
 Eye-in-Hand 下红斑在图像中近似恒定。盲跳到位后检测红斑像素 $s=(s_x,s_y)$，定义**锚点**（蓝光预测落点 = 目标应现位置）：
 
-$$\text{anchor}=s+\Delta$$
+```math
+\text{anchor}=s+\Delta
+```
+在当前帧候选杂草框 $\lbrace b_i \rbrace$ 中选离锚点最近、且在门限 $R$ 内者为靶点：
 
-在当前帧候选杂草框 $\{b_i\}$ 中选离锚点最近、且在门限 $R$ 内者为靶点：
-
-$$b^\*=\arg\min_i\lVert b_i-\text{anchor}\rVert_2,\quad \lVert b^\*-\text{anchor}\rVert\le R$$
-
+```math
+b^{*}=\arg\min_i\lVert b_i-\text{anchor}\rVert_2,\quad \lVert b^{*}-\text{anchor}\rVert\le R
+```
 **仅需简易标定、对标定误差鲁棒**：全系统只需标定两个量——每像素角度 $k$ 与光斑偏移 $\Delta$（粗标即可），无需图像雅可比矩阵与高精度手眼外参标定。锚点由红斑的**物理实测位置**确定：标定残差、机械回程、舵机量化等造成的盲跳偏差被红斑**自动吸收**——标不准也能像素级对准。这是本方案区别于依赖图像雅可比矩阵的经典 IBVS 之处。
 
 **红斑检测**（`find_red_spot`）采用多重判据保证野外鲁棒：R−max(G,B) 红主导评分 → 亮度门（剔除土壤等暗红背景）→ 形态学闭运算 → 面积窗 + 圆度过滤（剔除长条反光）→ ROI hint 加速（优先在上次位置附近搜索）。
@@ -85,10 +88,11 @@ $$b^\*=\arg\min_i\lVert b_i-\text{anchor}\rVert_2,\quad \lVert b^\*-\text{anchor
 
 > 📄 `laser_calibration/vision_servo.py`（选框）、`strike_planner.py`（下发已打/待打坐标）
 
-多目标 + 相机运动时，需判定候选框归属“当前目标 / 已清除 / 其它待清”，以**杜绝重复打击**。设当前目标中心参考坐标 $C_2$、其它目标集合 $\{P_j\}$，由 anchor 得中心参考系到当前帧的平移量 $\tau=\text{anchor}-C_2$，则其它目标当前帧预测位 $P_j'=P_j+\tau$。当多个候选逼近 anchor（歧义）时，对候选 $b$ 假设其为当前目标（平移 $e_2=b-\text{anchor}$），检验其它目标预测位是否各有**不同**的框印证（容差 $\tau_0$）：
+多目标 + 相机运动时，需判定候选框归属“当前目标 / 已清除 / 其它待清”，以**杜绝重复打击**。设当前目标中心参考坐标 $C_2$、其它目标集合 $\lbrace P_j \rbrace$，由 anchor 得中心参考系到当前帧的平移量 $\tau=\text{anchor}-C_2$，则其它目标当前帧预测位 $P_j'=P_j+\tau$。当多个候选逼近 anchor（歧义）时，对候选 $b$ 假设其为当前目标（平移 $e_2=b-\text{anchor}$），检验其它目标预测位是否各有**不同**的框印证（容差 $\tau_0$）：
 
-$$\text{score}(b)=\#\{\,j:\exists\,b_k\ne b,\ \lVert b_k-(P_j'+e_2)\rVert\le \tau_0\,\}$$
-
+```math
+\mathrm{score}(b)=\bigl|\lbrace\, j : \exists\, b_k\ne b,\ \lVert b_k-(P_j'+e_2)\rVert\le \tau_0 \,\rbrace\bigr|
+```
 取得分最大者为当前目标；全无印证则**安全拒收**（本帧不打）。**原理**：Eye-in-Hand 下全场景共享同一平移，唯有真正的当前目标其 $e_2$ 能同时对齐所有其它框，错框（已打）对不齐而被排除。该思想同于多目标跟踪的“相机运动补偿 + 数据关联”，**实测可拦截对已清除目标的重复打击**。
 
 ### 2.4 量化感知闭环控制　Quantization-Aware Servo Control
@@ -97,15 +101,16 @@ $$\text{score}(b)=\#\{\,j:\exists\,b_k\ne b,\ \lVert b_k-(P_j'+e_2)\rVert\le \ta
 
 针对 1° 分辨率 PWM 舵机的量化限制。每 1° 对应像素位移 $q=1/k$（约 10–20 px）。由像素误差 $e$ 计算期望角度增量并**量化为整数度**下发：
 
-$$\Delta\theta_{cmd}=\operatorname{round}(K_p\cdot k\cdot e)$$
-
-锁定判据为**整数度移动量为零**（误差 $<q/2$ 时 $\operatorname{round}(\cdot)=0$），锁定于**可达最优网格点**，并记录历史最优、连续无改善则回锁。**原理**：承认量化精度地板（约 5 px），在“激光已能命中”的精度内主动收手，避免在栅格相邻格点间反复横跳/过冲——从而在廉价舵机上达成接近物理极限的**像素级**对准，体现“低成本硬件 + 量化感知算法 = 高精度”。
+```math
+\Delta\theta_{cmd}=\mathrm{round}(K_p\cdot k\cdot e)
+```
+锁定判据为**整数度移动量为零**（误差 $<q/2$ 时 $\mathrm{round}(\cdot)=0$），锁定于**可达最优网格点**，并记录历史最优、连续无改善则回锁。**原理**：承认量化精度地板（约 5 px），在“激光已能命中”的精度内主动收手，避免在栅格相邻格点间反复横跳/过冲——从而在廉价舵机上达成接近物理极限的**像素级**对准，体现“低成本硬件 + 量化感知算法 = 高精度”。
 
 ### 2.5 多目标决策与调度　Multi-Target Planning
 
 > 📄 `laser_calibration/strike_planner.py`
 
-云台归中后在中心参考系采帧得目标集合 $\{T_i\}$（原始坐标记账，避免运动干扰投票）；按**贪心最近**排序最小化累计转动；逐个下发（随附**已清除集合 $S$** 与**待清除集合 $Q$** 供身份核验）；成功则 $S\leftarrow S\cup\{T\}$，失败则重排回 $Q$ 重试；去重由 2.3 保证。一片清空后通知底盘前进，进入下一轮闭环。**系统只有这一个决策入口**——单目标即“队列长度为 1 的多目标”，同一套投票—建队—派发—核销流程（网页 manual/auto 为开发调试通道，默认关闭、不参与自动作业）。
+云台归中后在中心参考系采帧得目标集合 $\lbrace T_i \rbrace$（原始坐标记账，避免运动干扰投票）；按**贪心最近**排序最小化累计转动；逐个下发（随附**已清除集合 $S$** 与**待清除集合 $Q$** 供身份核验）；成功则 $S\leftarrow S\cup\lbrace T \rbrace$，失败则重排回 $Q$ 重试；去重由 2.3 保证。一片清空后通知底盘前进，进入下一轮闭环。**系统只有这一个决策入口**——单目标即“队列长度为 1 的多目标”，同一套投票—建队—派发—核销流程（网页 manual/auto 为开发调试通道，默认关闭、不参与自动作业）。
 
 ### 2.6 NDVI 三层定标　NDVI with Vicarious Calibration
 
@@ -113,8 +118,9 @@ $$\Delta\theta_{cmd}=\operatorname{round}(K_p\cdot k\cdot e)$$
 
 区别于“两路 DN 值直接套公式”的朴素做法，本系统 NDVI 采用**低成本代理定标（vicarious calibration）**：暗电流减除 + PTFE 漫反射板（灰卡）K 系数修正，将 R / NIR 两通道拉至同一辐射基准：
 
-$$NDVI=\frac{K\cdot NIR'-R'}{K\cdot NIR'+R'},\quad R'=DN_R-dark_R,\ \ K=\frac{R'_{gray}}{NIR'_{gray}}$$
-
+```math
+NDVI=\frac{K\cdot NIR'-R'}{K\cdot NIR'+R'},\quad R'=DN_R-dark_R,\ \ K=\frac{R'_{gray}}{NIR'_{gray}}
+```
 系统按三层模式**自动降级**：① 主动定标（标定四完成，接近真值 NDVI）→ ② 反射率色卡定标 → ③ 相对（伪）NDVI 兜底（未标定时仅作长势相对比较）。距离/材质效应在比值与 K 修正中抵消；换光照/场景需重新标定。
 
 **时序长势监测模式**：相对 NDVI 虽不具备跨设备绝对可比性，但在“同一设备、同一标定、同一田块”下具有良好时序一致性。系统据此支持以天为周期对同一批作物定点采集，通过指数的**相对变化趋势**做长势监测与胁迫预警——指数持续下降往往早于肉眼可见的黄化萎蔫，是病害/缺水等胁迫的早期信号；完成 PTFE 灰卡定标后可进一步输出接近真值的健康分级。由此形成“**除草作业顺带巡检**”模式：每次下田，同时完成清除与体检。
