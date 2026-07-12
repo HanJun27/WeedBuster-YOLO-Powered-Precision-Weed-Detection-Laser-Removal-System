@@ -2,6 +2,10 @@
 """
 yolo_detector.py —— YOLO 杂草检测节点 (v3.9.9 统一版；v3.10.7 加 stamp 字段)
 
+v3.11.2 修复: v3.11.1 的 ExG 运行时开关其实没接通 —— image_callback 调
+  filter_boxes_by_exg 时漏传 enable=self._exg_enable,过滤永远走 config 默认值,
+  网页按钮点了、日志也打了,但行为不变。本版补上这一处传参(一行),开关真正生效。
+
 v3.11.1: ExG 假草过滤改为运行时可切换。新增订阅 /yolo/exg_enable (Bool):
   vision_servo 8093 网页[ExG]按钮发布 → 本节点即时开/关 self._exg_enable
   (filter_boxes_by_exg 接收 enable 参数,不再硬读 config 常量),无需重启即可现场
@@ -359,7 +363,11 @@ class YoloDetectorNode(Node):
         # v3.10.13: ExG 物理光谱闸门 —— 拦截 YOLO 空锁假草(详见 config 注释)。
         #   在此统一过滤,BPU/CPU 两路都覆盖;bgr 即本帧原图。全被拦则 boxes 空,
         #   publish_timer 自然发 detected=False,下游从源头收不到假目标。
-        boxes = filter_boxes_by_exg(bgr, boxes, self.get_logger())
+        # v3.11.2 修复: 必须显式传 enable=self._exg_enable!
+        #   v3.11.1 漏传了 → 走函数定义时绑定的 config 默认值,网页开关只改标志位、
+        #   过滤行为纹丝不动("运行时开关"实际是死的)。本行是 v3.11.1 ③ 的真正落地。
+        boxes = filter_boxes_by_exg(bgr, boxes, self.get_logger(),
+                                    enable=self._exg_enable)
 
         with self._lock:
             self._latest_boxes = boxes

@@ -376,3 +376,18 @@ EXG_SHADOW_SUM    = 40      # R+G+B < 此值 → 死黑阴影,剔除
 #   漏拦假草(地面噪声仍进队)  → 调高 EXG_MIN_RATIO(如 0.20~0.25)
 #   强阳光过曝严重            → 适当调低 EXG_OVEREXP(如 235)
 #   日志看 [ExG] 行的 ratio 值,据此定门限最直接
+
+
+# ════════════════════════════════════════════════════════════════
+#  ★ v3.14.0 新增:端侧 ASR 语音控制 (方案 C)
+# ════════════════════════════════════════════════════════════════
+#  RDK X5 上跑 sherpa-onnx Paraformer small 中文模型,浏览器采音后
+#  HTTP POST 到小车做识别 + 语法约束命令匹配。全链路端侧离线,零网络依赖。
+#  模型不存在时自动降级(不崩溃),日志提示下载方式。
+ASR_ENABLE           = True      # 总开关;模型不存在时自动降级不崩溃
+ASR_MODEL_DIR        = os.path.expanduser(
+    "~/laser_calibration/asr_models/paraformer-small")
+ASR_NUM_THREADS      = 2         # A55 小核数
+ASR_CMD_CONFIDENCE   = 0.40      # 命令匹配最低置信度(0~1)
+ASR_RECORD_MAX_SEC   = 5.0       # 单次录音最长秒数
+ASR_DEV_MODE_MSG     = "(dev_mode: 小车尚未加载 ASR 模型,请在 RDK 端安装 sherpa-onnx 并下载模型)"

@@ -1,0 +1,55 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  小车启动指令速查
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【SSH 连接】
+ssh sunrise@172.20.10.2
+yahboom
+
+【一键启动所有节点】
+cd ~/yahboomcar_ws && bash start_all.sh
+  (或从 Windows: cd e:\GongZuoTai\YOLO; python start_car.py)
+
+【停止所有节点】
+bash stop_all.sh
+
+【单独启动 vision_servo】
+bash -c 'source ~/yahboomcar_ws/install/setup.bash && \
+  ros2 run laser_calibration vision_servo'
+
+【端口转发 — 在 Windows 上运行】
+ssh -L 8093:172.20.10.2:8093 sunrise@172.20.10.2
+
+【8093 面板访问】
+浏览器打开 http://localhost:8093
+→ 🎤 按住说话按钮使用 ASR 语音控制
+
+【查看运行状态】
+ssh -t sunrise@172.20.10.2 "ss -tlnp | grep 8093"
+ssh -t sunrise@172.20.10.2 "ps aux | grep ros2"
+ssh -t sunrise@172.20.10.2 "tail -5 ~/logs/vision_servo.log"
+
+# 查看最近 20 行，过滤 ASR 相关
+ssh sunrise@172.20.10.2 "tail -30 ~/logs/vision_servo.log | grep -i 'asr|sherpa'"
+
+# 实时持续监控 ASR 日志
+ssh sunrise@172.20.10.2 "tail -f ~/logs/vision_servo.log | grep --line-buffered -i 'asr'"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  操作员端 faster-whisper 本地 ASR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【安装依赖】
+pip install faster-whisper
+
+【启动本地 ASR 服务（端口 8094）】
+cd E:\GongZuoTai\YOLO
+python laser_calibration\local_asr_server.py --model D:\models\faster-whisper-small
+  (或用 start_local_asr.bat 双击启动)
+
+【在 8093 面板中使用】
+1. 保持本地 ASR 服务运行中
+2. 刷新 http://localhost:8093
+3. 在 ASR 栏下拉框选择 "操作员端 faster-whisper"
+4. 输入模型路径，点击 "加载"
+5. 按住🎤说话即可使用本地识别

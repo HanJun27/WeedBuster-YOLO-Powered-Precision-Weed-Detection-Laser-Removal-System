@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-strike_planner.py —— Phase 3：多目标打击决策层  v0.5
+strike_planner.py —— Phase 3：多目标打击决策层  v0.6
 =====================================================
+v0.6（相对 v0.5，配合 vision_servo v3.11.2；决策逻辑零改动，只加"广播+记账"）：
+  ★ 新增 /planner/session_state 会话状态广播(5Hz)：state/total/pending/current/
+    struck/failed(+投票期的帧数与簇数)。vision_servo 网页订阅后把整个决策过程
+    画出来 —— 视频/答辩里评委能直接看到"投票建队→贪心排序→逐个清除→不重打"。
+  ★ 聚合执行层的蓝斑命中判定：strike_result 的 hit/hit_distance 附加字段记到
+    struck 目标上,patch_clear 与收尾日志输出"判定命中 X / 脱靶 Y / 未检出 Z"。
+    字段缺失(旧版执行层)时静默降级,完全向后兼容。
+
 v0.5（相对 v0.4，配合 vision_servo v3.10.11）：
   ★ strike_cmd 新增 "exclude" 字段：本片已打目标的中心参考坐标。执行层
     重捕获/跟踪选框时排除其邻域 → 杜绝"打二又打回一"式重复打击。
@@ -89,6 +97,9 @@ TOPIC_STRIKE_CMD     = "/servo/strike_cmd"        # 本节点 → vision_servo
 TOPIC_STRIKE_RESULT  = "/servo/strike_result"     # vision_servo → 本节点
 TOPIC_PATCH_CLEAR    = "/planner/patch_clear"     # 本节点 → 车控节点："本片清完"
 TOPIC_START_CLEARING = "/planner/start_clearing"  # 车控/人工 → 本节点："开始清场"
+# v0.6: 会话状态广播 —— vision_servo 网页订阅做决策可视化(纯显示)。
+#   ⚠️ 与 vision_servo.py 的 TOPIC_PLANNER_SESSION 字符串必须一致。
+TOPIC_SESSION_STATE  = "/planner/session_state"   # 本节点 → vision_servo(显示)
 
 # ── 画面尺寸（与 vision_servo 一致）──────────────────────────────
 IMG_W, IMG_H = 640, 480
@@ -167,6 +178,10 @@ class StrikePlanner(Node):
         # v0.4 (P1): 建队前请求执行层归中
         self.pub_recenter = self.create_publisher(
             Empty, TOPIC_SERVO_RECENTER, 10)
+        # v0.6: 会话状态广播(决策可视化,纯显示)
+        self.pub_session = self.create_publisher(
+            String, TOPIC_SESSION_STATE, 10)
+        self._last_result_extra = None   # v0.6: 最近一条 strike_result 的命中附加字段
 
         # ── YOLO 最新帧 ──
         self._latest_boxes = None     # list[dict] | None
@@ -200,13 +215,14 @@ class StrikePlanner(Node):
 
         log = self.get_logger().info
         log("═══════════════════════════════════════════════")
-        log("  strike_planner 决策层  v0.5")
+        log("  strike_planner 决策层  v0.6")
         log("═══════════════════════════════════════════════")
         log(f"  订阅 YOLO:      {TOPIC_YOLO}")
         log(f"  ← 触发清场:     {TOPIC_START_CLEARING}")
         log(f"  → 下发打击:     {TOPIC_STRIKE_CMD}")
         log(f"  ← 打击结果:     {TOPIC_STRIKE_RESULT}")
         log(f"  → 本片清完:     {TOPIC_PATCH_CLEAR}")
+        log(f"  → 会话广播:     {TOPIC_SESSION_STATE}（v0.6 决策可视化）")
         log("  ─────────────────────────────────────")
         if VOTE_MIN_RATIO > 0:
             log(f"  建队策略:       时序投票（窗口 {VOTE_WINDOW_SEC:.1f}s，"
@@ -278,6 +294,12 @@ class StrikePlanner(Node):
             d = json.loads(msg.data)
             rid = int(d["id"])
             result = str(d.get("result", "failed"))
+            # v0.6: 执行层 v3.11.2 起附带蓝斑命中判定;旧版无此字段 → None,兼容
+            self._last_result_extra = {
+                "hit": d.get("hit"),                  # True/False/None
+                "hit_dist": d.get("hit_distance"),
+                "hit_frames": d.get("hit_frames"),
+            }
         except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
             self.get_logger().error(f"strike_result 解析失败：{e}")
             return
@@ -296,6 +318,15 @@ class StrikePlanner(Node):
     #  决策 FSM（5Hz）
     # ────────────────────────────────────────────────────────────
     def _tick(self):
+        # v0.6: 会话快照放 finally —— 每拍【结束后】广播本拍转换完成的最新状态
+        #   (放开头会让网页滞后一拍),任何 return 分支都覆盖,异常照常上抛。
+        #   小 JSON @5Hz,开销可忽略;纯显示,丢了也不影响任何决策。
+        try:
+            self._tick_inner()
+        finally:
+            self._publish_session()
+
+    def _tick_inner(self):
         now = time.time()
 
         # ── IDLE：等触发 → 建队 → 进 CLEARING ──
@@ -371,9 +402,11 @@ class StrikePlanner(Node):
             if now < self._dispatch_block_until:
                 return
             if not self._queue:
+                nh, nm, nu = self._hit_counts()
                 self.get_logger().info(
                     f"[PLANNER] ■ 本片清完：成功 {len(self._struck)} / "
-                    f"失败 {len(self._failed)} / 共 {self._session_total}")
+                    f"失败 {len(self._failed)} / 共 {self._session_total}"
+                    f"  ｜命中判定: ✓{nh} ✗{nm} ?{nu}")
                 self._publish_patch_clear()
                 self.state = ST_IDLE
                 return
@@ -404,7 +437,15 @@ class StrikePlanner(Node):
             return
 
         if result == "success":
-            self.get_logger().info(f"[PLANNER] ✅ id={cur['id']} 打击成功")
+            # v0.6: 把执行层的命中判定记到该目标上(缺失=None,不影响任何决策)
+            extra = self._last_result_extra or {}
+            cur["hit"] = extra.get("hit")
+            cur["hit_dist"] = extra.get("hit_dist")
+            self._last_result_extra = None
+            _hit_txt = ("" if cur["hit"] is None else
+                        ("  🎯判定命中" if cur["hit"] else "  ⚠️判定脱靶") +
+                        (f" d={cur['hit_dist']}px" if cur["hit_dist"] is not None else ""))
+            self.get_logger().info(f"[PLANNER] ✅ id={cur['id']} 打击成功{_hit_txt}")
             # v0.3: 与执行层归中保持一致。
             #   归中 → 云台实际回到画面中心，参考点用中心；
             #   不归中 → 云台停在该株草，参考点用该株草（贪心就近排序生效）。
@@ -583,12 +624,50 @@ class StrikePlanner(Node):
             f"已打排除 {len(self._struck)} 个  其它待打 {len(self._queue)} 个  "
             f"队列剩余 {len(self._queue)}")
 
+    def _hit_counts(self):
+        """v0.6: 统计本会话已打目标的命中判定 (命中, 脱靶, 未检出/未启用)。"""
+        nh = sum(1 for t in self._struck if t.get("hit") is True)
+        nm = sum(1 for t in self._struck if t.get("hit") is False)
+        nu = len(self._struck) - nh - nm
+        return nh, nm, nu
+
+    def _publish_session(self):
+        """v0.6: 广播会话快照(5Hz,由 _tick 末尾调用)。纯显示数据。"""
+        def _t(t):
+            return {"id": t["id"], "x": t["x"], "y": t["y"]}
+        def _ts(t):
+            d = _t(t)
+            d["hit"] = t.get("hit")
+            d["hit_dist"] = t.get("hit_dist")
+            return d
+        nh, _, _ = self._hit_counts()
+        payload = {
+            "state": self.state,
+            "total": self._session_total,
+            "pending": [_t(t) for t in self._queue],
+            "current": _t(self._current) if self._current else None,
+            "struck": [_ts(t) for t in self._struck],
+            "failed": [_t(t) for t in self._failed],
+            "hits": nh,
+        }
+        if self.state == ST_VOTING:
+            payload["voting"] = {"frames": self._vote_frames,
+                                 "clusters": len(self._vote_clusters)}
+        msg = String()
+        msg.data = json.dumps(payload)
+        self.pub_session.publish(msg)
+
     def _publish_patch_clear(self):
+        nh, nm, nu = self._hit_counts()
         msg = String()
         msg.data = json.dumps({
             "cleared": len(self._struck),
             "failed": len(self._failed),
             "total": self._session_total,
+            # v0.6: 蓝斑命中判定统计(执行层不支持时全 0/None,消费端可忽略)
+            "hit_confirmed": nh,
+            "hit_missed": nm,
+            "hit_unseen": nu,
         })
         self.pub_patch_clear.publish(msg)
         self.get_logger().info(

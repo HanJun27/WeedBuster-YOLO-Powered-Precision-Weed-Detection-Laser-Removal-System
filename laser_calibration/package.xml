@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>laser_calibration</name>
-  <version>3.11.1</version>
+  <version>3.13.0</version>
   <description>
     双目多光谱感知与闭环激光打击系统 ——
     Phase 1 开机静态标定（双目对齐 + 激光偏移）+
@@ -19,6 +19,7 @@
   <depend>python3-yaml</depend>
 
   <exec_depend>v4l-utils</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>

@@ -13,4 +13,4 @@ laser_calibration —— 双目多光谱感知与闭环激光打击系统
   from laser_calibration.robot_ctrl import set_servo, laser_blue, laser_ir
 """
 
-__version__ = "3.11.1"
+__version__ = "3.13.0"

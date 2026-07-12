@@ -41,6 +41,9 @@ TOPIC_CMD_VEL        = "cmd_vel"            # 与扬声键盘遥控同名(相对
 TOPIC_CH_START       = "/chassis/start"
 TOPIC_CH_STOP        = "/chassis/stop"
 TOPIC_SAFETY_STOP    = "/safety_stop"
+# v3.13.0: 底盘状态广播(纯发布) —— 任务面板显示 走/停/清 的实时状态。
+#   ⚠️ 与 vision_servo.py 的 TOPIC_CHASSIS_STATE 字符串必须一致。
+TOPIC_CH_STATE       = "/chassis/state"
 
 MIN_CONF = 0.50         # 停车判定的置信度下限(与 planner 建队一致)
 TICK_SEC = 0.10         # 10Hz:状态机节拍 = cmd_vel 发布节拍
@@ -60,6 +63,8 @@ class ChassisController(Node):
         self.pub_start_clearing = self.create_publisher(
             Empty, TOPIC_START_CLEARING, 10)
         self.pub_recenter = self.create_publisher(Empty, TOPIC_RECENTER, 10)
+        # v3.13.0: 状态广播(纯显示,收不到也不影响任何控制)
+        self.pub_state = self.create_publisher(String, TOPIC_CH_STATE, 10)
 
         self.create_subscription(String, TOPIC_YOLO, self._cb_yolo, 10)
         self.create_subscription(String, TOPIC_PATCH_CLEAR,
@@ -118,6 +123,10 @@ class ChassisController(Node):
         t = Twist()
         t.linear.x = float(vx)
         self.pub_vel.publish(t)          # 每拍都发:速度为 0 也发,看门狗友好
+        # v3.13.0: 每拍广播底盘状态(小 JSON,纯显示)
+        sm = String()
+        sm.data = json.dumps({"state": self.fsm.state, "vx": round(float(vx), 3)})
+        self.pub_state.publish(sm)
 
 
 def main():

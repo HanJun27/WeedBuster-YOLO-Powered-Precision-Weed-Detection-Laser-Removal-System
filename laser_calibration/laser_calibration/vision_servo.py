@@ -1,6 +1,36 @@
 #!/usr/bin/env python3
 """
-vision_servo.py —— Phase 3：视觉伺服闭环打击  v3.11.1
+vision_servo.py —— Phase 3：视觉伺服闭环打击  v3.13.0
+=====================================================
+v3.13.0（任务面板:8093 升格为整机演示驾驶舱;全部为显示/控制面薄层,打击链零改动）：
+  ① 任务控制栏:🚗发车(/chassis/start)·⏸收工(/chassis/stop)·🛑急停(/safety_stop,
+     同时本地立即停光停伺服) 三按钮 + 底盘/决策实时状态灯(订阅 /chassis/state)。
+  ② 🌱 相对绿度健康指数:1Hz 对 crop 类框算 ExG 均值(纸靶演示可用;NDVI 对打印
+     纸无近红外反射,真植物场景请看 8080/8081 的 NDVI 流),折线+相对基线Δ%。
+  ③ 📜 整片作业历史:订阅 /planner/patch_clear,逐片记录 清除/失败/命中统计。
+=====================================================
+v3.12.0（作业统计全管线 + 全场RANSAC全局关联[默认关]；打击几何/闭环零改动）：
+  ① 作业统计：每发打击(成功/失败)记录 → 内存(网页📊面板:成功率/命中率/平均误差/
+     单株耗时/逐发偏差折线) + 落盘 ~/strike_logs/*.jsonl(答辩数据,analyze_strike_logs
+     离线出报告)。记录点在 _publish_strike_result 汇聚漏斗(rejected 不算发),纯观测。
+  ② 全场 RANSAC 全局关联(REACQ_GLOBAL_ASSOC,默认 False=行为与 v3.11.2 逐字一致)：
+     身份核验从"anchor 局部共识"升级为"全账本×全候选 1点RANSAC 估全局平移 + 贪心
+     一对一分配"。当前目标被遮挡而已打株挤进 anchor 时(v3.11.1 承认的诚实边界),
+     全局版能用任意旁证框(或平移先验 tie-break)判"该框属于已打株"→安全拒,不重打。
+     开关只切换"选哪个框"这一步;共识版代码原样保留,现场 A/B 后决定是否启用。
+=====================================================
+v3.11.2（蓝斑命中判定 + 决策队列可视化；打击几何/闭环/身份核验零改动）：
+v3.11.2（蓝斑命中判定 + 决策队列可视化；打击几何/闭环/身份核验零改动）：
+  ① 蓝斑命中判定(纯观测)：打印靶无烧痕可验,但点火 1s 里蓝紫光斑就在纸上、相机
+     看得见。灼烧段的 wait 切成 ~80ms 小片,片间采帧用 find_blue_spot(B−max(G,R),
+     与红斑同管线)在瞄准点 ROI 检蓝斑,中位位置−瞄准点 ≤HIT_TOL_PX 判命中,
+     检出帧不足判"未检出"(弃权,不算脱靶)。结果只进日志/strike_result 附加字段/
+     网页战报,绝不改 FSM、不触发重打;_fire_cancel 中止语义与 v3.10.6 逐字一致。
+     HIT_CHECK_ENABLE=False 完全恢复 v3.11.1 点火行为。
+  ② 决策队列可视化：订阅 /planner/session_state(strike_planner v0.6 广播),
+     侧栏列出 已打(含命中判定)/打击中/待打/放弃;画面叠加按 session_shift 平移
+     的目标标记(云台居中→(0,0);伺服中→靶点−锁存,与身份核验同一个量;坐标系
+     未知→不画叠加只留侧栏,绝不画错图)。全部纯显示。
 =====================================================
 v3.11.1（多目标鲁棒性 + 显示修复 + ExG 运行时开关；eye-in-hand：相机固定在云台、
   红/蓝激光固定在相机上表面，三者随云台同转）：
@@ -310,7 +340,12 @@ from laser_calibration.config import (
     TOPIC_RGB, TOPIC_YOLO, TOPIC_EXG_ENABLE,
     EXG_FILTER_ENABLE,
     YOLO_FALLBACK_TO_LOCKED, YOLO_TARGET_FRESH_SEC,
+    # v3.14.0: 端侧 ASR
+    ASR_ENABLE, ASR_MODEL_DIR, ASR_NUM_THREADS,
+    ASR_CMD_CONFIDENCE, ASR_DEV_MODE_MSG, ASR_RECORD_MAX_SEC,
 )
+# v3.14.0: ASR 引擎
+from laser_calibration.asr_server import AsrEngine
 # v3.10.2: 不再导入 PID_KP/KI/KD/PID_OUTPUT_LIMIT/PID_SATURATION_FRAMES
 #   —— Kp/Ki/Kd 在量化感知控制器下另有默认值；饱和跳帧逻辑已移除。
 from laser_calibration.robot_ctrl import (
@@ -388,6 +423,52 @@ IDENTITY_MARGIN_PX   = 15.0
 #   挑证实数最多者;无任何证实(歧义且无旁证)则安全拒打。eye-in-hand 下全场景同量平移,
 #   故正确平移能同时对齐所有框,错框(如把已打#1当#2)的平移对不齐其它框 → 被排除。
 CONSENSUS_TOL_PX     = 20.0
+
+# ── v3.11.2: 蓝斑命中判定(纯观测,不回写任何控制状态)────────────────
+# 打的是 A4 打印靶,低功率蓝紫激光不留烧痕 → 无法"烧后复检";但点火那 1s 里
+# 蓝紫光斑本身就打在纸上、RGB 相机看得见。于是在 _fire_sequence 灼烧期间以
+# ~12Hz 采帧,用 find_blue_spot(B−max(G,R),与红斑同一套管线)在瞄准点附近的
+# ROI 里检蓝斑,取中位数位置与瞄准点比距离 → 判 命中/脱靶/未检出。
+# ⚠️ 安全边界:这是【只读】功能 —— 判定结果只进日志/strike_result 附加字段/
+#   网页显示,绝不改 FSM、绝不触发重打;采样循环用 _fire_cancel.wait() 切片,
+#   紧急停止的唤醒语义与 v3.10.6 完全一致(一 set 立刻退出→关激光→中止清理)。
+# ⚠️ 上车第一步:405nm 蓝紫光在便宜 RGB sensor 上的通道响应因模组而异,先按
+#   README 的验证步骤用 [S3 测试烧] 看一次日志里的蓝斑检出情况再定阈值。
+HIT_CHECK_ENABLE      = True    # 关掉=完全恢复 v3.11.1 点火行为(整段跳过)
+BLUE_DOMINANCE_MIN    = 25      # B−max(G,R) 阈值。405nm 常带红响应 → 比红斑的 30 略松;
+                                #   日志打 [HIT] maxBlueScore,据此调:检不出→调低(如 15),
+                                #   误检蓝色杂物→调高(ROI 已物理隔绝远处干扰,一般不用)
+HIT_TOL_PX            = 30.0    # 蓝斑中位位置−瞄准点 ≤ 此值判"命中"。按打印靶半宽定:
+                                #   靶宽 ~80px 就设 35~40;宁严勿松,视频里"命中"要有说服力
+HIT_SAMPLE_PERIOD_SEC = 0.08    # 灼烧期采样间隔(1s 灼烧 ≈ 12 帧)
+HIT_MIN_FRAMES        = 2       # 检出帧数 < 此值 → 判"未检出"(unseen),不判脱靶——
+                                #   相机看不见蓝斑是传感器问题,不能冤枉打击链路
+
+# v3.11.2: 决策层可视化 —— strike_planner 广播会话状态(队列/当前/已打/失败),
+#   本节点订阅后透传给 8093 网页,叠加画到画面上(纯显示,不参与任何决策)。
+#   ⚠️ 与 strike_planner.py 的同名常量字符串必须一致。
+TOPIC_PLANNER_SESSION = "/planner/session_state"
+
+# ── v3.12.0: 作业统计(纯观测) ────────────────────────────────────
+STRIKE_LOG_ENABLE = True          # 每发打击落盘 JSONL(内存统计不受此开关影响)
+STRIKE_LOG_DIR    = "~/strike_logs"   # 每次节点启动新开一个 strike_YYYYmmdd_HHMMSS.jsonl
+SHOT_MEM_MAX      = 400           # 内存保留的最近发数(网页面板/统计用)
+
+# ── v3.12.0: 全场 RANSAC 全局关联(身份核验升级,默认关) ──────────
+# False = 选框逻辑与 v3.11.2 完全一致(走原共识平移代码)。上车 A/B:
+#   台架摆 3 靶复跑 v3.11.1 README 的验证 3,再置 True 重跑;全局版应在
+#   "当前目标遮挡+已打株挤进 anchor"场景打出 [关联] 拒收日志而非重打。
+REACQ_GLOBAL_ASSOC = False
+
+# ── v3.13.0: 任务面板(全部纯显示/薄控制面) ──────────────────────
+# ⚠️ 与 chassis_controller.py 的同名常量字符串必须一致。
+TOPIC_CHASSIS_START  = "/chassis/start"
+TOPIC_CHASSIS_STOP   = "/chassis/stop"
+TOPIC_CHASSIS_STATE  = "/chassis/state"
+TOPIC_PATCH_CLEAR    = "/planner/patch_clear"
+HEALTH_SAMPLE_SEC    = 1.0     # 健康指数采样周期
+HEALTH_SERIES_MAX    = 900     # 序列最长(1Hz→15分钟)
+PATCH_HISTORY_MAX    = 30      # 整片历史保留条数
 
 # v3.10.3: PID 调参持久化文件 —— 网页改完参数自动存盘，下次启动自动加载
 PID_TUNING_FILE = os.path.expanduser("~/.laser_calibration/pid_tuning.json")
@@ -502,6 +583,235 @@ def find_red_spot(bgr: np.ndarray, hint_x: int = None, hint_y: int = None):
         lx, ly, _ = max(cands, key=lambda t: t[2])
 
     return (x1 + lx, y1 + ly)
+
+
+# ══════════════════════════════════════════════════════════════
+#  v3.11.2: 蓝紫激光光斑检测（命中判定用，纯观测）
+#  与 find_red_spot 同一套管线（主导通道差 + 亮度门 + 闭运算填过曝白芯 +
+#  面积/紧凑度过滤 + 最近 hint 优先），只把红主导换成蓝主导 B−max(G,R)。
+#  刻意不与 find_red_spot 合并成一个泛型函数 —— 红斑路径是 PID 闭环的命脉，
+#  deadline 前不冒重构风险；克隆版怎么改都伤不到打击链路。
+# ══════════════════════════════════════════════════════════════
+def find_blue_spot(bgr: np.ndarray, hint_x: int = None, hint_y: int = None):
+    """蓝紫激光光斑检测，返回 (cx, cy, max_score) 或 None。
+    max_score = ROI 内 B−max(G,R) 的最大值（阈值调参观测用，日志会打印）。"""
+    if bgr is None or bgr.size == 0:
+        return None
+    h, w = bgr.shape[:2]
+
+    if hint_x is not None and hint_y is not None:
+        half = SPOT_ROI_SIZE // 2
+        y1 = max(0, int(hint_y) - half)
+        y2 = min(h, int(hint_y) + half)
+        x1 = max(0, int(hint_x) - half)
+        x2 = min(w, int(hint_x) + half)
+    else:
+        y1, y2, x1, x2 = 0, h, 0, w
+
+    roi = bgr[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None
+
+    b, g, r = cv2.split(roi)
+    b_i  = b.astype(np.int16)
+    g_i  = g.astype(np.int16)
+    r_i  = r.astype(np.int16)
+    max_gr = np.maximum(g_i, r_i)
+    blue_score = np.clip(b_i - max_gr, 0, 255).astype(np.uint8)
+    max_score = int(blue_score.max())
+
+    _, mask = cv2.threshold(blue_score, BLUE_DOMINANCE_MIN, 255,
+                            cv2.THRESH_BINARY)
+
+    # 亮度门：激光斑（含蓝晕）很亮；暗蓝背景（阴影/蓝色印刷）虽蓝但不亮
+    if SPOT_REQUIRE_BRIGHT:
+        bright = roi.max(axis=2)
+        _, bmask = cv2.threshold(bright, SPOT_BRIGHT_MIN, 255,
+                                 cv2.THRESH_BINARY)
+        mask = cv2.bitwise_and(mask, bmask)
+
+    kernel = np.ones((SPOT_CLOSE_KERNEL_SIZE, SPOT_CLOSE_KERNEL_SIZE),
+                     np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    cands = []
+    for c in cnts:
+        a = cv2.contourArea(c)
+        if not (RED_SPOT_AREA_MIN < a < RED_SPOT_AREA_MAX):
+            continue
+        if SPOT_MIN_COMPACTNESS > 0:
+            (_cx, _cy), _rad = cv2.minEnclosingCircle(c)
+            circ_area = np.pi * _rad * _rad
+            if circ_area <= 0 or (a / circ_area) < SPOT_MIN_COMPACTNESS:
+                continue
+        m = cv2.moments(c)
+        if m["m00"] == 0:
+            continue
+        lx = int(m["m10"] / m["m00"])
+        ly = int(m["m01"] / m["m00"])
+        cands.append((lx, ly, a))
+    if not cands:
+        return None
+
+    if hint_x is not None and hint_y is not None:
+        hx_local = int(hint_x) - x1
+        hy_local = int(hint_y) - y1
+        lx, ly, _ = min(
+            cands,
+            key=lambda t: (t[0] - hx_local) ** 2 + (t[1] - hy_local) ** 2)
+    else:
+        lx, ly, _ = max(cands, key=lambda t: t[2])
+
+    return (x1 + lx, y1 + ly, max_score)
+
+
+# ══════════════════════════════════════════════════════════════
+#  v3.12.0: 全场 2D 平移 1点RANSAC + 全局一对一分配(纯几何,可离线测试)
+#  eye-in-hand 下云台一转全场同量平移 → 运动模型只有一个 2D 平移 e。
+#  对(账本点×候选框)每一配对生成假设 e,数内点(账本预测位 tol 内有专属框),
+#  取内点最多者(平手取离 anchor 先验 e0 最近者);再在最优 e* 下做贪心一对一
+#  分配,看"当前目标"分到了哪个框。与共识版的区别:已打/待打株与候选框的
+#  对应关系是全局一致解出来的,当前目标漏检时也能判"anchor 旁那框是已打株
+#  的"→ 拒收;共识版此场景(无旁证框时)会退化(v3.11.1 README 诚实边界)。
+# ══════════════════════════════════════════════════════════════
+def associate_global(anchor, locked_ref, cand_pts, struck_ref, other_ref,
+                     gate, tol):
+    """返回 (chosen_idx or None, info)。chosen_idx 指向 cand_pts。
+    anchor      : 当前目标在当前画面的预测位(红斑+Δ 或上帧靶点)
+    locked_ref  : 当前目标中心参考系坐标
+    cand_pts    : [(x,y)] 本帧过滤后的候选框中心(当前姿态坐标系)
+    struck_ref / other_ref : 已打 / 其它待打目标(中心参考系)
+    gate        : 平移修正量 |e−e0| 的信任域(用当前目标门限);None=不限
+    tol         : 内点/分配容差(沿用 CONSENSUS_TOL_PX)"""
+    ax, ay = float(anchor[0]), float(anchor[1])
+    lx, ly = float(locked_ref[0]), float(locked_ref[1])
+    e0 = (ax - lx, ay - ly)                 # anchor 先验平移
+    ledger = [("cur", lx, ly)]
+    ledger += [("struck", float(x), float(y)) for x, y in struck_ref]
+    ledger += [("other",  float(x), float(y)) for x, y in other_ref]
+    if not cand_pts:
+        return None, {"reason": "no_cand"}
+    hyps = [e0]
+    for _, Lx, Ly in ledger:
+        for bx, by in cand_pts:
+            hyps.append((bx - Lx, by - Ly))
+    best_key, best_e, best_assign = None, None, None
+    for ex, ey in hyps:
+        de0 = ((ex - e0[0]) ** 2 + (ey - e0[1]) ** 2) ** 0.5
+        # 注意:信任域检查放在【接受】阶段而非此处 —— 在生成阶段就按 |e−e0|
+        # 筛,会把"2+内点旁证的正确假设"错杀(先验偏大时),反而让贴着先验的
+        # 1 内点错误假设胜出。多内点本身就是压倒先验的独立证据。
+        pairs = []
+        for li, (_, Lx, Ly) in enumerate(ledger):
+            px, py = Lx + ex, Ly + ey
+            for ci, (bx, by) in enumerate(cand_pts):
+                d = ((bx - px) ** 2 + (by - py) ** 2) ** 0.5
+                if d <= tol:
+                    pairs.append((d, li, ci))
+        pairs.sort()
+        used_l, used_c, assign = set(), set(), {}
+        for d, li, ci in pairs:             # 贪心一对一(近配优先)
+            if li in used_l or ci in used_c:
+                continue
+            used_l.add(li); used_c.add(ci); assign[li] = (ci, d)
+        key = (len(assign), -de0)
+        if best_key is None or key > best_key:
+            best_key, best_e, best_assign = key, (ex, ey), assign
+    if best_key is None or not best_assign:
+        return None, {"reason": "no_match", "e0": e0}
+    info = {"e": (round(best_e[0], 1), round(best_e[1], 1)),
+            "inliers": best_key[0],
+            "shift_corr": round(-best_key[1], 1)}
+    cur_m = best_assign.get(0)              # 账本 0 号 = 当前目标
+    if cur_m is None:
+        # 当前目标本帧无匹配(遮挡/漏检),而别的账本点认领了框 → 安全拒收
+        return None, {**info, "reason": "cur_unmatched"}
+    ci, d = cur_m
+    _de0 = -best_key[1]                     # 先验修正量 |e*−e0|
+    if best_key[0] >= 2:                    # 有旁证:全局一致
+        # 信任域(宽,2×gate):旁证是压倒先验的证据,但修正量离谱仍拒 ——
+        # 那意味着红斑/Δ 系统已彻底失灵,该走 PID 超时→planner 重试,不硬救。
+        if gate is not None and _de0 > 2.0 * gate:
+            return None, {**info, "reason": "consensus_beyond_trust"}
+        return ci, {**info, "cur_d": round(d, 1), "mode": "consensus"}
+    # 仅当前目标匹配、无旁证 → 退保守(等价于共识版单候选规则):
+    #   信任域(严,gate):无旁证时只信先验附近的解
+    if gate is not None and _de0 > gate:
+        return None, {**info, "reason": "lone_beyond_trust"}
+    bx, by = cand_pts[ci]
+    da = ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5
+    if gate is not None and da > gate:
+        return None, {**info, "reason": "lone_beyond_gate"}
+    opreds = [(x + best_e[0], y + best_e[1]) for _, x, y in ledger[1:]]
+    if opreds:
+        do = min(((bx - px) ** 2 + (by - py) ** 2) ** 0.5
+                 for px, py in opreds)
+        if do < d:
+            return None, {**info, "reason": "closer_to_other"}
+    return ci, {**info, "cur_d": round(d, 1), "mode": "lone"}
+
+
+# ══════════════════════════════════════════════════════════════
+#  v3.12.0: 作业统计聚合(纯函数,可离线测试)
+# ══════════════════════════════════════════════════════════════
+def compute_shot_stats(shots):
+    """由打击记录列表算聚合统计。字段全部可能为 None(样本不足)。"""
+    def _mean(vals):
+        vals = [v for v in vals if v is not None]
+        return round(sum(vals) / len(vals), 2) if vals else None
+    n = len(shots)
+    succ = [r for r in shots if r.get("result") == "success"]
+    hit  = [r for r in succ if r.get("hit") is True]
+    miss = [r for r in succ if r.get("hit") is False]
+    judged = len(hit) + len(miss)
+    return {
+        "shots": n,
+        "success": len(succ),
+        "failed": n - len(succ),
+        "success_rate": round(len(succ) / n, 3) if n else None,
+        "hit": len(hit), "miss": len(miss),
+        "unjudged": len(succ) - judged,
+        "hit_rate": round(len(hit) / judged, 3) if judged else None,
+        "avg_lock_err": _mean([r.get("final_distance") for r in succ]),
+        "avg_hit_dist": _mean([r.get("hit_dist") for r in hit + miss]),
+        "avg_duration": _mean([r.get("duration") for r in succ]),
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+#  v3.13.0: 相对绿度健康指数(纯函数,可离线测试)
+#  对 crop 类框内像素算 ExG = 2G−R−B 的框均值再取平均。选 ExG 而非 NDVI
+#  是演示现实:打印纸没有植被的近红外反射,NDVI 对纸靶恒≈0;真植物场景
+#  的 NDVI 能力由 stereo_camera 的 8080/8081 页面承担。指数只做【相对】
+#  趋势解读(同机位同光照下比变化),面板照此标注,不做绝对健康声明。
+# ══════════════════════════════════════════════════════════════
+def compute_green_index(bgr, boxes):
+    """返回 (指数均值 or None, 参与框数)。boxes: [{cx,cy,w,h},...] 像素坐标。"""
+    if bgr is None or bgr.size == 0 or not boxes:
+        return None, 0
+    h, w = bgr.shape[:2]
+    vals = []
+    for b in boxes:
+        try:
+            cx, cy = float(b["cx"]), float(b["cy"])
+            bw, bh = float(b.get("w", 40)), float(b.get("h", 40))
+        except (KeyError, TypeError, ValueError):
+            continue
+        x1 = max(0, int(cx - bw / 2)); x2 = min(w, int(cx + bw / 2))
+        y1 = max(0, int(cy - bh / 2)); y2 = min(h, int(cy + bh / 2))
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            continue
+        roi = bgr[y1:y2, x1:x2].astype(np.int16)
+        exg = 2 * roi[:, :, 1] - roi[:, :, 2] - roi[:, :, 0]
+        vals.append(float(np.clip(exg, 0, None).mean()))
+    if not vals:
+        return None, 0
+    return round(sum(vals) / len(vals), 1), len(vals)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -625,7 +935,39 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>🎯 视觉伺服 · Phase 3 v3.10.12 (绝对角盲跳·不归中链式打击 · 邻域跟踪·红斑锚点 · 单轴解耦)</h1>
+<h1>🎛 除草任务面板 · v3.13.0 (视觉伺服 · 决策可视化 · 作业统计 · 健康监测)</h1>
+
+<!-- v3.13.0: 任务控制栏 -->
+<div class="stat-box" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:8px 0">
+  <button class="btn" style="background:#161;font-size:15px;padding:8px 22px" onclick="missionCmd('start')">🚗 发车(自动作业)</button>
+  <button class="btn" style="background:#444;font-size:15px;padding:8px 22px" onclick="missionCmd('stop')">⏸ 收工</button>
+  <button class="btn" style="background:#a11;font-size:15px;padding:8px 26px;font-weight:bold" onclick="missionCmd('estop')">🛑 急停</button>
+  <span style="margin-left:8px">底盘 <span id="m-chassis" style="font-weight:bold;color:#888">--</span></span>
+  <span>决策 <span id="m-planner" style="font-weight:bold;color:#888">--</span></span>
+  <span>执行 <span id="m-servo" style="font-weight:bold;color:#888">--</span></span>
+  <span>本场 <span id="m-brief" style="color:#0f0">0/0 发</span></span>
+</div>
+
+<!-- v3.14.0: 语音控制(ASR 端侧识别 + 操作员端 faster-whisper 备用) -->
+<div class="stat-box" style="display:flex;align-items:center;gap:8px;margin:8px 0;flex-wrap:wrap">
+  <button id="pttBtn" class="btn" style="background:#335;font-size:14px;padding:8px 20px;user-select:none"
+          onmousedown="startRecord()" onmouseup="stopRecord()"
+          ontouchstart="startRecord()" ontouchend="stopRecord()">🎤 按住说话</button>
+  <select id="mic-select" style="background:#333;color:#0f0;border:1px solid #555;font-family:monospace;font-size:12px;max-width:220px" onchange="onMicChange()"></select>
+  <select id="asr-backend" style="background:#333;color:#0f0;border:1px solid #555;font-family:monospace;font-size:12px" onchange="onAsrBackendChange()">
+    <option value="rdk">🤖 RDK端侧 sherpa-onnx</option>
+    <option value="local">💻 操作员端 faster-whisper</option>
+  </select>
+  <span id="local-asr-config" style="display:none;font-size:12px;color:#888">
+    模型:
+    <input type="text" id="model-path" placeholder="模型目录路径..."
+           style="background:#333;color:#0f0;border:1px solid #555;font-family:monospace;font-size:12px;width:200px">
+    <button class="btn" style="padding:2px 8px;font-size:11px" onclick="setLocalModel()">加载</button>
+    <span id="model-status" style="font-size:11px"></span>
+  </span>
+  <span>语音 <span id="asr-status" style="color:#888">就绪</span></span>
+  <span id="asr-result" style="color:#fa0;font-size:13px"></span>
+</div>
 
 <div id="calib-banner" style="display:none; background:#600; color:#fff; padding:10px 14px;
      border:2px solid #f55; border-radius:4px; margin-bottom:10px;
@@ -739,6 +1081,52 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="stat-row"><span class="stat-key">量化台阶 / 本轮最佳</span><span class="stat-val" id="s-quant">--</span></div>
       <div class="stat-row"><span class="stat-key">上步整数度移动</span><span class="stat-val" id="s-move">--</span></div>
       <div class="stat-row"><span class="stat-key">连续锁定帧数</span><span class="stat-val" id="s-lock">0/0</span></div>
+    </div>
+
+    <!-- v3.11.2: 蓝斑命中判定战报(纯观测) -->
+    <div class="stat-box">
+      <div class="group-title">🎯 打击战报 (蓝斑命中判定)</div>
+      <div class="stat-row"><span class="stat-key">最近一发</span><span class="stat-val" id="s-hit-last">--</span></div>
+      <div class="stat-row"><span class="stat-key">累计 命中/脱靶/未检出</span><span class="stat-val" id="s-hit-stats">0 / 0 / 0</span></div>
+      <div class="info">判定纯观测,不影响打击流程;"未检出"=相机没看到蓝斑,弃权不算脱靶。</div>
+    </div>
+
+    <!-- v3.11.2: strike_planner 决策会话面板 -->
+    <div class="stat-box">
+      <div class="group-title">🗂 决策队列 (strike_planner)</div>
+      <div class="stat-row"><span class="stat-key">会话状态</span><span class="stat-val" id="s-sess-state">--</span></div>
+      <div id="s-sess-list" style="font-size:12px; line-height:1.7; margin-top:4px; color:#888">(无会话数据 —— strike_planner 未运行或未触发清场)</div>
+    </div>
+
+    <!-- v3.12.0: 作业统计(内存+JSONL 全管线) -->
+    <div class="stat-box">
+      <div class="group-title">📊 作业统计
+        <button class="btn" style="float:right;padding:2px 10px;font-size:12px" onclick="statsReset()">重置</button>
+      </div>
+      <div class="stat-row"><span class="stat-key">打击 成功/总数</span><span class="stat-val" id="s-st-succ">0 / 0</span></div>
+      <div class="stat-row"><span class="stat-key">判定命中率</span><span class="stat-val" id="s-st-hit">--</span></div>
+      <div class="stat-row"><span class="stat-key">平均锁定误差</span><span class="stat-val" id="s-st-err">--</span></div>
+      <div class="stat-row"><span class="stat-key">平均命中偏差</span><span class="stat-val" id="s-st-hd">--</span></div>
+      <div class="stat-row"><span class="stat-key">平均单株耗时</span><span class="stat-val" id="s-st-dur">--</span></div>
+      <canvas id="statChart" width="360" height="120" style="width:100%;background:#111;border-radius:4px;margin-top:6px"></canvas>
+      <div class="info">逐发命中偏差折线:绿=命中 红=脱靶 灰=未判定 紫=失败;虚线=HIT_TOL。
+        同步落盘 ~/strike_logs/*.jsonl,离线 <code>ros2 run laser_calibration analyze_strike_logs</code> 出报告。</div>
+    </div>
+
+    <!-- v3.13.0: 相对绿度健康 -->
+    <div class="stat-box">
+      <div class="group-title">🌱 植物健康(相对绿度指数)</div>
+      <div class="stat-row"><span class="stat-key">当前指数 / 参与株数</span><span class="stat-val" id="s-hl-cur">--</span></div>
+      <div class="stat-row"><span class="stat-key">相对基线变化</span><span class="stat-val" id="s-hl-delta">--</span></div>
+      <canvas id="healthChart" width="360" height="100" style="width:100%;background:#111;border-radius:4px;margin-top:6px"></canvas>
+      <div class="info">对 crop 类框逐秒采样 ExG(2G−R−B)均值,只做<b>相对</b>趋势解读(同机位同光照)。
+        打印靶演示可用;真植物 NDVI 见 8080/8081 双光谱流。</div>
+    </div>
+
+    <!-- v3.13.0: 整片作业历史 -->
+    <div class="stat-box">
+      <div class="group-title">📜 整片作业历史</div>
+      <div id="s-patch-list" style="font-size:12px;line-height:1.7;color:#888">(尚无 —— 每清完一片自动记一行)</div>
     </div>
 
     <div class="stat-box">
@@ -866,6 +1254,135 @@ function drawOverlays() {
       ctx.stroke();
     }
   }
+
+  // v3.11.2: 决策队列叠加 —— planner 会话目标(中心参考系)按 session_shift
+  //   平移到当前画面。shift 为 null(坐标系未知)时不画,只留侧栏列表,绝不画错图。
+  var ps = lastState.planner_session;
+  var shift = lastState.session_shift;
+  var psAge = lastState.planner_session_age_sec;
+  if (ps && shift && psAge !== undefined && psAge !== null && psAge < 2.0 &&
+      ps.state && ps.state !== 'IDLE') {
+    var drawT = function(t, color, tag, dash) {
+      if (!t) return;
+      var x = t.x + shift.dx, y = t.y + shift.dy;
+      ctx.strokeStyle = color; ctx.lineWidth = 2;
+      if (dash) ctx.setLineDash([5, 4]);
+      ctx.beginPath(); ctx.arc(x, y, 16, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = color; ctx.font = 'bold 13px monospace';
+      ctx.fillText('#' + t.id + tag, x - 14, y - 22);
+    };
+    (ps.pending || []).forEach(function(t){ drawT(t, '#aaa', '', true); });
+    (ps.failed  || []).forEach(function(t){ drawT(t, '#f55', ' ✗', false); });
+    (ps.struck  || []).forEach(function(t){
+      drawT(t, (t.hit === false ? '#fa0' : '#0f0'), ' ✓', false);
+    });
+    drawT(ps.current, '#ff0', ' ◀', false);
+  }
+
+  // v3.11.2: 最近一发命中判定的大标记(4s 内显示;下一发盲跳后画面已平移,隐藏)
+  var lh = lastState.last_hit;
+  var lhAge = lastState.last_hit_age_sec;
+  if (lh && lhAge !== undefined && lhAge !== null && lhAge < 4.0 &&
+      lastState.fsm_state !== 'COARSE') {
+    var hp = lh.pos || lh.aim;
+    if (hp) {
+      var col = lh.verdict === 'hit' ? '#0f0'
+              : lh.verdict === 'miss' ? '#f55' : '#888';
+      var txt = lh.verdict === 'hit' ? ('✓ 命中 d=' + lh.dist + 'px')
+              : lh.verdict === 'miss' ? ('✗ 脱靶 d=' + lh.dist + 'px')
+              : '? 蓝斑未检出';
+      ctx.strokeStyle = col; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(hp.x, hp.y, 24, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = col; ctx.font = 'bold 16px monospace';
+      ctx.fillText(txt, Math.max(8, Math.min(hp.x + 30, 420)), hp.y + 5);
+    }
+  }
+}
+
+// v3.12.0: 作业统计折线(逐发命中偏差;无判定值退用锁定误差)
+function drawStatsChart(shots, tol) {
+  var cv = document.getElementById('statChart');
+  if (!cv) return;
+  var c2 = cv.getContext('2d');
+  c2.clearRect(0, 0, cv.width, cv.height);
+  if (!shots.length) {
+    c2.fillStyle = '#555'; c2.font = '12px monospace';
+    c2.fillText('暂无打击记录(打一发就有了)', 10, 22);
+    return;
+  }
+  var vals = shots.map(function(s) {
+    return (s.hit_dist != null) ? s.hit_dist
+         : (s.final_distance != null ? s.final_distance : 0);
+  });
+  var W = cv.width, H = cv.height, pad = 18;
+  var ymax = Math.max(tol || 30, Math.max.apply(null, vals)) * 1.2 + 1;
+  var n = shots.length;
+  var X = function(i) { return pad + (W - 2 * pad) * (n === 1 ? 0.5 : i / (n - 1)); };
+  var Y = function(v) { return H - pad + 4 - (H - 2 * pad) * (v / ymax); };
+  if (tol) {
+    c2.strokeStyle = '#666'; c2.setLineDash([4, 4]);
+    c2.beginPath(); c2.moveTo(pad, Y(tol)); c2.lineTo(W - pad, Y(tol)); c2.stroke();
+    c2.setLineDash([]);
+  }
+  c2.strokeStyle = '#48f'; c2.lineWidth = 1; c2.beginPath();
+  for (var i = 0; i < n; i++) {
+    if (i === 0) c2.moveTo(X(i), Y(vals[i])); else c2.lineTo(X(i), Y(vals[i]));
+  }
+  c2.stroke();
+  for (var j = 0; j < n; j++) {
+    var sh = shots[j];
+    var col = sh.result !== 'success' ? '#c4f'
+            : (sh.hit === true ? '#0f0' : (sh.hit === false ? '#f55' : '#999'));
+    c2.fillStyle = col;
+    c2.beginPath(); c2.arc(X(j), Y(vals[j]), 3, 0, Math.PI * 2); c2.fill();
+  }
+  c2.fillStyle = '#888'; c2.font = '10px monospace';
+  c2.fillText('0', 4, H - pad + 7);
+  c2.fillText(String(Math.round(ymax)), 4, pad + 4);
+  if (tol) c2.fillText('TOL', W - pad - 24, Y(tol) - 3);
+}
+// v3.13.0: 任务命令(急停零确认;发车确认一次防误触)
+function missionCmd(cmd) {
+  if (cmd === 'estop') { fetch('/api/estop').then(refreshState); return; }
+  if (cmd === 'start' && !confirm('确认发车?小车将开始自动巡航-清除作业')) return;
+  fetch('/api/mission_' + cmd).then(refreshState);
+}
+// v3.13.0: 健康折线(自动量程 + 基线虚线)
+function drawHealthChart(series, baseline) {
+  var cv = document.getElementById('healthChart');
+  if (!cv) return;
+  var c2 = cv.getContext('2d');
+  c2.clearRect(0, 0, cv.width, cv.height);
+  if (!series || series.length < 2) {
+    c2.fillStyle = '#555'; c2.font = '12px monospace';
+    c2.fillText('等待 crop 框进入画面…', 10, 20); return;
+  }
+  var vs = series.map(function(p) { return p[1]; });
+  var lo = Math.min.apply(null, vs.concat([baseline || 1e9]));
+  var hi = Math.max.apply(null, vs.concat([baseline || -1e9]));
+  var pad = 14, W = cv.width, H = cv.height;
+  if (hi - lo < 1) { hi += 1; lo -= 1; }
+  var X = function(i) { return pad + (W - 2 * pad) * i / (series.length - 1); };
+  var Y = function(v) { return H - pad - (H - 2 * pad) * (v - lo) / (hi - lo); };
+  if (baseline != null) {
+    c2.strokeStyle = '#666'; c2.setLineDash([4, 4]); c2.beginPath();
+    c2.moveTo(pad, Y(baseline)); c2.lineTo(W - pad, Y(baseline));
+    c2.stroke(); c2.setLineDash([]);
+  }
+  c2.strokeStyle = '#3d5'; c2.lineWidth = 1.5; c2.beginPath();
+  for (var i = 0; i < series.length; i++) {
+    if (i === 0) c2.moveTo(X(i), Y(vs[i])); else c2.lineTo(X(i), Y(vs[i]));
+  }
+  c2.stroke();
+  c2.fillStyle = '#888'; c2.font = '10px monospace';
+  c2.fillText(String(Math.round(hi)), 4, pad + 4);
+  c2.fillText(String(Math.round(lo)), 4, H - pad + 4);
+}
+
+function statsReset() {
+  if (confirm('清零本场作业统计?(磁盘 JSONL 日志不会删除)'))
+    fetch('/api/stats_reset').then(refreshState);
 }
 
 function drawCross(x, y, color, label) {
@@ -1034,6 +1551,155 @@ function refreshState() {
       banner.style.display = 'none';
     }
 
+    // v3.11.2: 打击战报面板
+    var lh2 = d.last_hit;
+    var lastEl = document.getElementById('s-hit-last');
+    if (lastEl) {
+      if (lh2 && lh2.verdict === 'hit') {
+        lastEl.textContent = '✓ 命中 d=' + lh2.dist + 'px (' + lh2.frames + '帧)';
+        lastEl.style.color = '#0f0';
+      } else if (lh2 && lh2.verdict === 'miss') {
+        lastEl.textContent = '✗ 脱靶 d=' + lh2.dist + 'px (' + lh2.frames + '帧)';
+        lastEl.style.color = '#f55';
+      } else if (lh2) {
+        lastEl.textContent = '? 蓝斑未检出 (' + (lh2.frames || 0) + '帧)';
+        lastEl.style.color = '#888';
+      } else {
+        lastEl.textContent = '--';
+        lastEl.style.color = '#888';
+      }
+    }
+    var hsEl = document.getElementById('s-hit-stats');
+    if (hsEl && d.hit_stats) {
+      hsEl.textContent = d.hit_stats.hit + ' / ' + d.hit_stats.miss +
+                         ' / ' + d.hit_stats.unseen;
+    }
+
+    // v3.11.2: 决策队列侧栏(始终可见,不依赖叠加层的坐标平移)
+    var ps2 = d.planner_session;
+    var ssEl = document.getElementById('s-sess-state');
+    var slEl = document.getElementById('s-sess-list');
+    if (ssEl && slEl) {
+      if (ps2 && ps2.state) {
+        var nStruck = (ps2.struck || []).length;
+        ssEl.textContent = ps2.state +
+          (ps2.total ? ('  ' + nStruck + '/' + ps2.total) : '');
+        ssEl.style.color = ({'IDLE':'#888','VOTING':'#fa0',
+          'CLEARING':'#0f0','WAIT_RESULT':'#ff0'})[ps2.state] || '#0f0';
+        var html = '';
+        if (ps2.state === 'VOTING' && ps2.voting) {
+          html += '<div style="color:#fa0">⏳ 投票中: 已累积 ' +
+                  ps2.voting.frames + ' 帧 / ' + ps2.voting.clusters +
+                  ' 个候选簇</div>';
+        }
+        var line = function(icon, color, t, extra) {
+          return '<div style="color:' + color + '">' + icon + ' #' + t.id +
+                 ' (' + t.x + ',' + t.y + ')' + (extra || '') + '</div>';
+        };
+        (ps2.struck || []).forEach(function(t) {
+          var ex = (t.hit === true)
+            ? ' 已打 ✓命中' + (t.hit_dist != null ? ' d=' + t.hit_dist + 'px' : '')
+            : (t.hit === false)
+              ? ' 已打 ⚠判偏' + (t.hit_dist != null ? ' d=' + t.hit_dist + 'px' : '')
+              : ' 已打 (蓝斑未检出)';
+          html += line('●', (t.hit === false ? '#fa0' : '#0f0'), t, ex);
+        });
+        if (ps2.current) html += line('▶', '#ff0', ps2.current, ' 打击中…');
+        (ps2.pending || []).forEach(function(t) {
+          html += line('○', '#aaa', t, ' 待打');
+        });
+        (ps2.failed || []).forEach(function(t) {
+          html += line('✗', '#f55', t, ' 放弃');
+        });
+        if (ps2.state === 'IDLE' && ps2.total) {
+          html += '<div style="color:#0f0;margin-top:2px">■ 上一片: 成功 ' +
+                  nStruck + ' / 共 ' + ps2.total +
+                  (ps2.hits != null ? ('，判定命中 ' + ps2.hits) : '') + '</div>';
+        }
+        slEl.innerHTML = html || '(队列空)';
+      } else {
+        ssEl.textContent = '--';
+        slEl.textContent = '(无会话数据 —— strike_planner 未运行或未触发清场)';
+      }
+    }
+
+    // v3.13.0: 任务控制栏状态灯
+    var ch = d.chassis, chAge = d.chassis_age_sec;
+    var chEl = document.getElementById('m-chassis');
+    if (chEl) {
+      if (ch && chAge !== null && chAge < 2.0) {
+        chEl.textContent = ch.state + (ch.vx ? (' ' + ch.vx + 'm/s') : '');
+        chEl.style.color = ({'CRUISE':'#0f0','CLEARING':'#ff0','BRAKE':'#fa0',
+          'BLIND_ROLL':'#4af','STANDBY':'#888','FAULT':'#f55'})[ch.state] || '#ccc';
+      } else { chEl.textContent = '离线'; chEl.style.color = '#666'; }
+    }
+    var mp = document.getElementById('m-planner');
+    if (mp) {
+      var ps3 = d.planner_session;
+      mp.textContent = (ps3 && ps3.state) ? ps3.state : '--';
+      mp.style.color = (ps3 && ps3.state === 'CLEARING') ? '#0f0'
+                     : (ps3 && ps3.state === 'VOTING') ? '#fa0' : '#888';
+    }
+    var ms = document.getElementById('m-servo');
+    if (ms) { ms.textContent = d.fsm_state || '--';
+      ms.style.color = d.fsm_state === 'IDLE' ? '#888' : '#0f0'; }
+    var mb = document.getElementById('m-brief');
+    if (mb && d.shot_stats) {
+      mb.textContent = d.shot_stats.success + '/' + d.shot_stats.shots + ' 发' +
+        (d.shot_stats.hit_rate != null
+          ? (' · 命中 ' + Math.round(d.shot_stats.hit_rate * 100) + '%') : '');
+    }
+
+    // v3.13.0: 健康面板
+    var hl = d.health;
+    var hc = document.getElementById('s-hl-cur');
+    var hd = document.getElementById('s-hl-delta');
+    if (hc && hd) {
+      if (hl) {
+        hc.textContent = hl.cur + '  (' + hl.n_box + ' 株)';
+        if (hl.delta_pct != null) {
+          hd.textContent = (hl.delta_pct >= 0 ? '+' : '') + hl.delta_pct + '%';
+          hd.style.color = hl.delta_pct >= -5 ? '#0f0' : '#fa0';
+        } else hd.textContent = '--';
+      } else { hc.textContent = '--(画面内无 crop 框)'; hd.textContent = '--'; }
+    }
+    drawHealthChart(hl ? hl.series : null, hl ? hl.baseline : null);
+
+    // v3.13.0: 整片历史
+    var pl = document.getElementById('s-patch-list');
+    if (pl) {
+      var hist = d.patch_history || [];
+      if (hist.length) {
+        pl.innerHTML = hist.slice().reverse().map(function(h) {
+          var hit = (h.hit_confirmed != null)
+            ? (' · 命中' + h.hit_confirmed + (h.hit_missed ? ('/偏' + h.hit_missed) : '')) : '';
+          var col = (h.failed ? '#fa0' : '#0f0');
+          return '<div style="color:' + col + '">[' + (h.at || '') + '] 清除 ' +
+                 h.cleared + '/' + h.total + (h.failed ? (' · 放弃' + h.failed) : '') +
+                 hit + '</div>';
+        }).join('');
+      }
+    }
+
+    // v3.12.0: 作业统计面板
+    var st2 = d.shot_stats;
+    var _set = function(id, v, color) {
+      var el = document.getElementById(id);
+      if (el) { el.textContent = v; if (color) el.style.color = color; }
+    };
+    if (st2) {
+      _set('s-st-succ', st2.success + ' / ' + st2.shots +
+        (st2.success_rate != null ? ' (' + Math.round(st2.success_rate * 100) + '%)' : ''),
+        st2.failed > 0 ? '#fa0' : '#0f0');
+      _set('s-st-hit', st2.hit_rate != null
+        ? (Math.round(st2.hit_rate * 100) + '%  (' + st2.hit + '✓/' + st2.miss + '✗/' + st2.unjudged + '?)')
+        : '--', st2.hit_rate != null && st2.hit_rate < 1 ? '#fa0' : '#0f0');
+      _set('s-st-err', st2.avg_lock_err != null ? st2.avg_lock_err + ' px' : '--');
+      _set('s-st-hd',  st2.avg_hit_dist != null ? st2.avg_hit_dist + ' px' : '--');
+      _set('s-st-dur', st2.avg_duration != null ? st2.avg_duration + ' s' : '--');
+    }
+    drawStatsChart(d.shots || [], d.hit_tol_px);
+
     if (d.error) {
       history_px.push(d.error.x);
       history_py.push(d.error.y);
@@ -1112,6 +1778,9 @@ fetch('/api/state').then(r => r.json()).then(d => {
   }
 });
 
+// 加载麦克风列表（首次可能无标签，录音授权后会刷新）
+loadMicList();
+
 refreshState();
 
 let currentPublishFreq = 10;
@@ -1151,6 +1820,257 @@ function setPublishFreq(freq) {
       console.error('❌ Request failed:', err);
       alert('Network error');
     });
+}
+
+// v3.14.0: ASR 语音控制 — 按住说话 → 浏览器采音 → POST 到小车 → 识别并执行
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
+let recordTimer = null;
+let selectedDeviceId = '';
+let ASR_BACKEND = 'rdk';  // 'rdk' | 'local'
+const LOCAL_ASR_URL = 'http://127.0.0.1:8094';
+
+// 枚举麦克风设备并填充下拉框（先请求权限以获取设备标签）
+function loadMicList() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+  // 静默请求权限，确保设备标签可用
+  navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+    stream.getTracks().forEach(function(t) { t.stop(); });
+  }).catch(function() {});
+  navigator.mediaDevices.enumerateDevices().then(devices => {
+    var sel = document.getElementById('mic-select');
+    if (!sel) return;
+    var audioInputs = devices.filter(function(d) { return d.kind === 'audioinput'; });
+    if (audioInputs.length === 0) {
+      sel.innerHTML = '<option value="">(无麦克风)</option>';
+      return;
+    }
+    var prevVal = sel.value;
+    sel.innerHTML = audioInputs.map(function(d, i) {
+      var label = d.label || ('麦克风 ' + (i + 1));
+      return '<option value="' + d.deviceId + '">' + label + '</option>';
+    }).join('');
+    // 恢复上次选中的设备，否则默认第一个
+    if (prevVal && Array.from(sel.options).some(function(o) { return o.value === prevVal; })) {
+      sel.value = prevVal;
+    }
+    selectedDeviceId = sel.value;
+  }).catch(function() {});
+}
+
+function onMicChange() {
+  selectedDeviceId = document.getElementById('mic-select').value;
+}
+
+function onAsrBackendChange() {
+  ASR_BACKEND = document.getElementById('asr-backend').value;
+  var cfg = document.getElementById('local-asr-config');
+  var sts = document.getElementById('asr-status');
+  cfg.style.display = (ASR_BACKEND === 'local') ? 'inline' : 'none';
+  if (ASR_BACKEND === 'local') {
+    sts.textContent = '本地';
+    // 检查本地服务状态
+    fetch(LOCAL_ASR_URL + '/health', { signal: AbortSignal.timeout(2000) })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        sts.textContent = d.model_loaded ? '本地 ✅' : '本地 ⚠ 待加载模型';
+      })
+      .catch(function() {
+        sts.textContent = '本地 ❌ 未连接';
+      });
+  } else {
+    sts.textContent = 'RDK端侧';
+  }
+}
+
+function setLocalModel() {
+  var path = document.getElementById('model-path').value;
+  if (!path) { alert('请输入模型路径'); return; }
+  var sts = document.getElementById('model-status');
+  sts.textContent = '加载中...';
+  sts.style.color = '#fa0';
+  fetch(LOCAL_ASR_URL + '/model', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: path }),
+    signal: AbortSignal.timeout(60000)  // 模型加载可能较慢
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok && d.loaded) {
+      sts.textContent = '✅ ' + d.size + ' 已加载';
+      sts.style.color = '#0f0';
+      document.getElementById('asr-status').textContent = '本地 ✅';
+    } else {
+      sts.textContent = '❌ ' + (d.error || '加载失败');
+      sts.style.color = '#f55';
+    }
+  }).catch(function(err) {
+    sts.textContent = '❌ 连接失败: ' + err.message;
+    sts.style.color = '#f55';
+  });
+}
+
+function startRecord() {
+  if (isRecording) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    document.getElementById('asr-status').textContent = '❌ 不支持麦克风';
+    return;
+  }
+  isRecording = true;
+  audioChunks = [];
+  document.getElementById('asr-status').textContent = '🔴 录音中...';
+  document.getElementById('pttBtn').style.background = '#a33';
+  document.getElementById('asr-result').textContent = '';
+
+  var constraints = {
+    sampleRate: 16000,
+    channelCount: 1,
+    echoCancellation: true,
+    noiseSuppression: true
+  };
+  if (selectedDeviceId) {
+    constraints.deviceId = { exact: selectedDeviceId };
+  }
+  navigator.mediaDevices.getUserMedia({ audio: constraints }).then(stream => {
+    // 用低码率减少传输量
+    mediaRecorder = new MediaRecorder(stream, {
+      mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+                ? 'audio/webm;codecs=opus' : 'audio/webm'
+    });
+    mediaRecorder.ondataavailable = e => {
+      if (e.data.size > 0) audioChunks.push(e.data);
+    };
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      sendAudio();
+    };
+    mediaRecorder.start();
+    // 超时自动停
+    recordTimer = setTimeout(() => { if (isRecording) stopRecord(); }, 5000);
+  }).catch(err => {
+    isRecording = false;
+    document.getElementById('asr-status').textContent = '❌ 麦克风被拒';
+    document.getElementById('pttBtn').style.background = '#335';
+  });
+}
+
+function stopRecord() {
+  if (!isRecording || !mediaRecorder) return;
+  isRecording = false;
+  document.getElementById('pttBtn').style.background = '#335';
+  if (recordTimer) { clearTimeout(recordTimer); recordTimer = null; }
+  if (mediaRecorder.state === 'recording') mediaRecorder.stop();
+}
+
+// 将 Float32 Array 编码为 16kHz 16bit mono WAV Blob
+function encodeWAV(samples, sampleRate) {
+  var buffer = new ArrayBuffer(44 + samples.length * 2);
+  var view = new DataView(buffer);
+  function writeStr(offset, str) {
+    for (var i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  }
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);       // chunk size
+  view.setUint16(20, 1, true);        // PCM
+  view.setUint16(22, 1, true);        // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);  // byte rate
+  view.setUint16(32, 2, true);        // block align
+  view.setUint16(34, 16, true);       // bits per sample
+  writeStr(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+  for (var i = 0; i < samples.length; i++) {
+    var s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+// 将 webm blob 转为 16kHz mono WAV blob
+function webmToWav(blob) {
+  return new Promise(function(resolve, reject) {
+    var reader = new FileReader();
+    reader.onload = function() {
+      var audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      audioCtx.decodeAudioData(reader.result, function(audioBuffer) {
+        // 混音为单声道 + 降采样到 16kHz
+        var orig = audioBuffer.getChannelData(0);
+        var origRate = audioBuffer.sampleRate;
+        // 直接重采样到 16kHz
+        var targetLen = Math.round(orig.length * 16000 / origRate);
+        var resampled = new Float32Array(targetLen);
+        for (var i = 0; i < targetLen; i++) {
+          var pos = i * origRate / 16000;
+          var idx = Math.floor(pos);
+          var frac = pos - idx;
+          if (idx + 1 < orig.length) {
+            resampled[i] = orig[idx] * (1 - frac) + orig[idx + 1] * frac;
+          } else {
+            resampled[i] = orig[idx] || 0;
+          }
+        }
+        var wavBlob = encodeWAV(resampled, 16000);
+        resolve(wavBlob);
+      }, function() { reject('decodeAudioData 失败'); });
+    };
+    reader.onerror = function() { reject('FileReader 错误'); };
+    reader.readAsArrayBuffer(blob);
+  });
+}
+
+function sendAudio() {
+  if (audioChunks.length === 0) return;
+  document.getElementById('asr-status').textContent = '⏳ 转换中...';
+  const webmBlob = new Blob(audioChunks, { type: 'audio/webm' });
+  webmToWav(webmBlob).then(function(wavBlob) {
+    var url = (ASR_BACKEND === 'rdk') ? '/api/asr' : LOCAL_ASR_URL + '/transcribe';
+    document.getElementById('asr-status').textContent = '⏳ 识别中 (' + (ASR_BACKEND === 'rdk' ? 'RDK' : '本地') + ')...';
+    fetch(url, { method: 'POST', body: wavBlob })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.ok && d.text) {
+          document.getElementById('asr-result').textContent = '「' + d.text + '」';
+          if (d.command) {
+            document.getElementById('asr-status').textContent = '✅ → ' + d.command;
+            // 自动执行命令
+            if (d.command === 'ESTOP') {
+              fetch('/api/estop').then(refreshState);
+            } else if (d.command === 'START') {
+              missionCmd('start');
+            } else if (d.command === 'STOP') {
+              missionCmd('stop');
+            } else if (d.command === 'CENTER') {
+              fetch('/api/center').then(refreshState);
+            } else if (d.command === 'LASER_ON') {
+              fetch('/api/laser_ir?on=1').then(refreshState);
+            } else if (d.command === 'LASER_OFF') {
+              fetch('/api/laser_ir?on=0').then(refreshState);
+            } else if (d.command === 'FIRE_TEST') {
+              fetch('/api/fire_test').then(refreshState);
+            } else {
+              document.getElementById('asr-status').textContent = '✅ 已识别: ' + d.command;
+            }
+          } else {
+            document.getElementById('asr-status').textContent = (ASR_BACKEND === 'local') ? '本地 ✅' : '⚠️ 未识别指令';
+          }
+        } else if (d.msg && d.msg.indexOf('dev_mode') >= 0) {
+          document.getElementById('asr-status').textContent = '⚠️ 仅开发模式';
+          document.getElementById('asr-result').textContent = d.msg;
+        } else {
+          document.getElementById('asr-status').textContent = '❌ ' + (d.error || d.msg || '识别失败');
+        }
+      })
+      .catch(function(err) {
+        document.getElementById('asr-status').textContent = '❌ 网络错误';
+        console.error('ASR fetch error:', err);
+      });
+  }).catch(function(err) {
+    document.getElementById('asr-status').textContent = '❌ 转码失败';
+    document.getElementById('asr-result').textContent = String(err);
+  });
 }
 
 
@@ -1263,6 +2183,35 @@ class VisionServoNode(Node):
         #   _exg_ui_state 仅供网页显示当前(已下发的)状态,初值取 config 默认。
         self._exg_ui_state = bool(EXG_FILTER_ENABLE)
         self.pub_exg_enable = self.create_publisher(Bool, TOPIC_EXG_ENABLE, 10)
+        # ── v3.11.2: 蓝斑命中判定(纯观测)运行态 ──────────────────
+        #   _last_hit 只在点火线程整体赋值(dict 引用原子交换),HTTP 线程只读 → 无竞态
+        self._last_hit = None          # {"id","verdict","dist","x","y","aim","frames","at"}
+        self._hit_stats = {"hit": 0, "miss": 0, "unseen": 0}   # 本次运行累计
+        # ── v3.11.2: planner 会话状态透传(纯显示) ────────────────
+        self._planner_session = None   # strike_planner 广播的会话快照 dict
+        self._planner_session_at = 0.0
+        # ── v3.13.0: 任务面板运行态(纯显示/薄控制面) ──────────────
+        self._chassis_state = None      # /chassis/state 最新 JSON
+        self._chassis_state_at = 0.0
+        self._patch_history = []        # /planner/patch_clear 逐片记录
+        self._crop_boxes = []           # 最近一帧 crop 类框(健康指数用)
+        self._health_series = []        # [(t, val, n_box)]
+        self.pub_ch_start = self.create_publisher(Empty, TOPIC_CHASSIS_START, 10)
+        self.pub_ch_stop  = self.create_publisher(Empty, TOPIC_CHASSIS_STOP, 10)
+        self.pub_safety   = self.create_publisher(Empty, TOPIC_SAFETY_STOP, 10)
+        self.sub_ch_state = self.create_subscription(
+            String, TOPIC_CHASSIS_STATE, self._cb_chassis_state, 10)
+        self.sub_patch    = self.create_subscription(
+            String, TOPIC_PATCH_CLEAR, self._cb_patch_clear, 10)
+        self.create_timer(HEALTH_SAMPLE_SEC, self._health_tick)
+        # ── v3.12.0: 作业统计运行态(纯观测) ──────────────────────
+        self._shots = []               # 每发打击记录(内存,SHOT_MEM_MAX 截断)
+        self._shots_n = 0              # 全局发数计数(重置统计时清零)
+        self._shot_lock = threading.Lock()   # fire线程/FSM定时器线程都会记账
+        self._shot_fp = None           # JSONL 句柄:None=未开 False=开失败(禁用)
+        self._servo_t0 = 0.0           # 本发伺服起始时刻(算单株耗时)
+        self.sub_session = self.create_subscription(
+            String, TOPIC_PLANNER_SESSION, self._cb_planner_session, 10)
         # v3.10.10 (P1): planner 建队前请求归中 —— 投票必须在参考位（居中）进行
         self.sub_recenter = self.create_subscription(
             Empty, TOPIC_SERVO_RECENTER, self._cb_recenter, 10)
@@ -1292,6 +2241,12 @@ class VisionServoNode(Node):
         # NOTE: 这个 sleep 在 __init__ 里跑，节点还没 spin，不阻塞回调，保留
         time.sleep(0.3)
 
+        # v3.14.0: 端侧 ASR 引擎
+        self.asr = (AsrEngine(ASR_MODEL_DIR, num_threads=ASR_NUM_THREADS,
+                              logger=lambda msg: self.get_logger().info(msg))
+                    if ASR_ENABLE else None)
+        self._asr_last_result = None   # 最后一条识别结果（供 API/state 查询）
+
         self._start_http()
         self.timer = self.create_timer(FSM_TICK_PERIOD_SEC, self._fsm_step)
 
@@ -1308,6 +2263,7 @@ class VisionServoNode(Node):
         log(f"  PID 参数:   Kp={self.kp}  Ki={self.ki}  Kd={self.kd}  "
             f"({'上次保存值' if self._pid_tuning_source == 'saved' else '默认值'})")
         log(f"  调参存盘:   {PID_TUNING_FILE}")
+        log(f"  ASR 语音:    {'✅ 已就绪 (' + str(self.asr._recognizer.__class__.__name__) + ')' if self.asr and self.asr.available else '❌ 未加载(仅模拟/dev_mode)' if self.asr else '已禁用'}")
         log(f"  单步上限:   {MAX_DEG_PER_STEP:.0f}°    Settle: {PID_SETTLE_TIME_SEC*1000:.0f}ms")
         log(f"  目标冻结:   {'开' if SERVO_FREEZE_TARGET else '关'}")
         log(f"  执行器:     MultiThreadedExecutor (4 threads)")
@@ -1432,6 +2388,10 @@ class VisionServoNode(Node):
                 return
 
             if boxes:
+                # v3.13.0: 顺手留存 crop 类框(健康指数采样用,纯观测)
+                self._crop_boxes = [
+                    b for b in boxes
+                    if str(b.get("label", "")).lower() == "crop"]
                 # v3.10.11: ① 框过滤 —— 只考虑 weed 且置信度达标的框。
                 #   (旧版不滤,锚点最近邻可能选中 crop 框或低置信闪烁框)
                 cand = [b for b in boxes
@@ -1480,7 +2440,39 @@ class VisionServoNode(Node):
                 #   · anchor 附近无候选 → 不在此处理,交下方门限逻辑([选框]告警)。
                 #   (注:简单"逐框最近预测"分类在残差大且目标相邻时会把已打#1误判成当前目标
                 #    → 重打;故改用共识平移。离线用例 S1 已复现该误判并验证本法修正。)
-                if servoing and self._locked_yolo_target is not None and (
+                _ga_accept = False   # v3.12.0: 全局关联接受标志(可越门限,见下)
+                if (REACQ_GLOBAL_ASSOC and servoing
+                        and self._locked_yolo_target is not None and (
+                        self._strike_exclude_ref or self._other_targets_ref)):
+                    # ── v3.12.0 全场 RANSAC 全局关联(默认关) ──
+                    #   替代下方共识版"选哪个框"这一步;其余(锚点/门限/日志节流)不变。
+                    _cxy = [(float(b.get("cx", 0)), float(b.get("cy", 0)), b)
+                            for b in cand]
+                    _idx, _ai = associate_global(
+                        (anchor_x, anchor_y),
+                        (float(self._locked_yolo_target["x"]),
+                         float(self._locked_yolo_target["y"])),
+                        [(x, y) for x, y, _ in _cxy],
+                        list(self._strike_exclude_ref),
+                        list(self._other_targets_ref),
+                        gate, CONSENSUS_TOL_PX)
+                    _now = time.time()
+                    if _now - self._sel_gate_log_at > 1.0:
+                        self._sel_gate_log_at = _now
+                        if _idx is None:
+                            self.get_logger().warn(
+                                f"[关联] 全局分配拒收本帧: {_ai.get('reason')}"
+                                f" e={_ai.get('e')} 内点={_ai.get('inliers', 0)}")
+                        elif _ai.get("mode") == "consensus":
+                            self.get_logger().info(
+                                f"[关联] 全局一致: e={_ai['e']} 内点="
+                                f"{_ai['inliers']} 当前目标 d={_ai['cur_d']}px")
+                    if _idx is not None:
+                        cand = [_cxy[_idx][2]]
+                        _ga_accept = True   # 全局一致可放行越门限的正确框
+                    else:
+                        cand = []
+                elif servoing and self._locked_yolo_target is not None and (
                         self._strike_exclude_ref or self._other_targets_ref):
                     _others = (list(self._strike_exclude_ref) +
                                list(self._other_targets_ref))
@@ -1540,7 +2532,7 @@ class VisionServoNode(Node):
                                   (b.get("cy", 0) - anchor_y)**2)
                 bx, by = float(best.get("cx", 0)), float(best.get("cy", 0))
                 d = ((bx - anchor_x)**2 + (by - anchor_y)**2) ** 0.5
-                if gate is not None and d > gate:
+                if gate is not None and d > gate and not _ga_accept:
                     # 最近的合规框也超出门限:大概率目标本帧闪烁漏检 →
                     #   重捕获:继续等;跟踪:沿用旧靶点。长时间无合规框由
                     #   PID_TIMEOUT_SEC 兜底 → failed → planner 重试重跳。
@@ -1687,6 +2679,47 @@ class VisionServoNode(Node):
         self._cmd_queue.append("center")
         self.get_logger().info("[RECENTER] 收到 /servo/recenter → 归中已入队")
 
+    # ── v3.13.0: 任务面板回调(全部纯显示) ────────────────────────
+    def _cb_chassis_state(self, msg):
+        try:
+            self._chassis_state = json.loads(msg.data)
+            self._chassis_state_at = time.time()
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    def _cb_patch_clear(self, msg):
+        try:
+            d = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            return
+        d["at"] = time.strftime("%H:%M:%S")
+        self._patch_history.append(d)
+        if len(self._patch_history) > PATCH_HISTORY_MAX:
+            del self._patch_history[:len(self._patch_history)
+                                    - PATCH_HISTORY_MAX]
+
+    def _health_tick(self):
+        """1Hz 采样相对绿度健康指数(crop 框;无 crop 则本拍无样本)。"""
+        try:
+            frame = self._get_rgb()
+            val, n = compute_green_index(frame, list(self._crop_boxes))
+            if val is not None:
+                self._health_series.append((round(time.time(), 1), val, n))
+                if len(self._health_series) > HEALTH_SERIES_MAX:
+                    del self._health_series[:len(self._health_series)
+                                            - HEALTH_SERIES_MAX]
+        except Exception:
+            pass                        # 纯显示,绝不反噬
+
+    # ── v3.11.2: planner 会话状态透传(纯显示,不参与任何决策) ────
+    def _cb_planner_session(self, msg):
+        """缓存 strike_planner 广播的会话快照,供 8093 网页叠加显示。"""
+        try:
+            self._planner_session = json.loads(msg.data)
+            self._planner_session_at = time.time()
+        except (json.JSONDecodeError, TypeError):
+            pass    # 显示层数据,坏了就不更新,绝不影响打击
+
     def _cb_strike_cmd(self, msg):
         """接收 strike_planner 下发的"打这个目标"指令并启动一次打击。"""
         try:
@@ -1719,19 +2752,66 @@ class VisionServoNode(Node):
         self._start_servo(target={"x": x, "y": y}, strike_id=sid,
                           exclude_ref=ex_list, other_ref=other_list)
 
-    def _publish_strike_result(self, strike_id, result, x, y, distance):
-        """向 strike_planner 回报一次打击结果。strike_id 为 None 时不发（手动/auto）。"""
+    # ── v3.12.0: 作业统计记账(纯观测,任何异常都不许影响打击) ────
+    def _log_shot(self, strike_id, result, x, y, distance,
+                  hit, hit_dist, hit_frames):
+        try:
+            now = time.time()
+            with self._shot_lock:
+                self._shots_n += 1
+                rec = {
+                    "n": self._shots_n, "t": round(now, 2),
+                    "id": strike_id, "result": result,
+                    "x": x, "y": y, "final_distance": distance,
+                    "hit": hit, "hit_dist": hit_dist,
+                    "hit_frames": hit_frames,
+                    "duration": (round(now - self._servo_t0, 2)
+                                 if self._servo_t0 > 0 else None),
+                }
+                self._shots.append(rec)
+                if len(self._shots) > SHOT_MEM_MAX:
+                    del self._shots[:len(self._shots) - SHOT_MEM_MAX]
+                if STRIKE_LOG_ENABLE and self._shot_fp is None:
+                    try:
+                        d = os.path.expanduser(STRIKE_LOG_DIR)
+                        os.makedirs(d, exist_ok=True)
+                        path = os.path.join(
+                            d, time.strftime("strike_%Y%m%d_%H%M%S.jsonl"))
+                        self._shot_fp = open(path, "a", buffering=1)
+                        self.get_logger().info(f"[STATS] 打击日志 → {path}")
+                    except OSError as e:
+                        self._shot_fp = False
+                        self.get_logger().warn(
+                            f"[STATS] 日志文件打开失败({e}),仅内存统计")
+                if self._shot_fp:
+                    self._shot_fp.write(
+                        json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:                     # 统计绝不反噬打击
+            self.get_logger().warn(f"[STATS] 记账异常忽略: {e}")
+
+    def _publish_strike_result(self, strike_id, result, x, y, distance,
+                               hit=None, hit_dist=None, hit_frames=None):
+        """向 strike_planner 回报一次打击结果。strike_id 为 None 时不发（手动/auto）。
+        v3.11.2: 附加命中判定字段(hit=True/False/None, None=未检出或未启用)。
+        planner 只读 id/result,附加字段向后兼容;新版 planner 会聚合进 patch_clear。
+        v3.12.0: 本函数是打击终局的汇聚漏斗 —— 先记作业统计再回报;
+        rejected(没真正开打)不算一发。手动打击(strike_id=None)只记账不回报。"""
+        if result != "rejected":
+            self._log_shot(strike_id, result, x, y, distance,
+                           hit, hit_dist, hit_frames)
         if strike_id is None:
             return
         msg = String()
         msg.data = json.dumps({
             "id": strike_id, "result": result,
             "x": x, "y": y, "final_distance": distance,
+            "hit": hit, "hit_distance": hit_dist, "hit_frames": hit_frames,
         })
         self.pub_strike_result.publish(msg)
         self.get_logger().info(
             f"[STRIKE] 回报结果: id={strike_id} {result} "
-            f"d={distance if distance is not None else '--'}")
+            f"d={distance if distance is not None else '--'}"
+            f"{'' if hit is None else ('  命中✓' if hit else '  脱靶✗')}")
 
     def _start_servo(self, target=None, strike_id=None, exclude_ref=None,
                      other_ref=None):
@@ -1770,6 +2850,7 @@ class VisionServoNode(Node):
 
         # v3.10.4: 记录本轮是否 planner 指定（决定结束时是否回报）
         self._strike_cmd_id = strike_id
+        self._servo_t0 = time.time()   # v3.12.0: 单株耗时从此刻起算(纯统计)
         # v3.10.11: 已打排除列表 —— 仅 planner 打击携带;手动/auto 触发清空,防残留
         self._strike_exclude_ref = list(exclude_ref) if exclude_ref else []
         # v3.11.1: 其它待打目标列表 —— 身份核验分类用;手动/auto 触发清空
@@ -2273,15 +3354,98 @@ class VisionServoNode(Node):
             f"⚡ 蓝紫激光(S3) ON → ID={LASER_BLUE_ID}, angle={LASER_ON_ANGLE}, "
             f"持续 {FIRE_DURATION_SEC}s"
         )
+        # v3.11.2: 点火前抓取瞄准点(命中判定的比较基准,纯观测)。
+        #   优先 live 靶点(邻域跟踪一路咬到锁定,是目标在【当前姿态】画面里的
+        #   最新位置);无则用 红斑+Δ(锁定时红斑≈required_spot,+Δ≈目标)。
+        _aim = None
+        if HIT_CHECK_ENABLE:
+            if self.yolo_target is not None:
+                _aim = (float(self.yolo_target["x"]),
+                        float(self.yolo_target["y"]))
+            elif self.current_spot is not None:
+                _hx, _hy = self.calib.spot_to_hit(
+                    self.current_spot["x"], self.current_spot["y"])
+                _aim = (float(_hx), float(_hy))
         self._set_blue_laser(True, fire=True)
 
         # ─ 阶段 2: 灼烧 ─ wait 返回 True 表示中途被叫醒
-        cancelled = self._fire_cancel.wait(FIRE_DURATION_SEC)
+        # v3.11.2: 整段 wait 切成 HIT_SAMPLE_PERIOD_SEC 小片,片间采帧检蓝斑
+        #   (命中判定,纯观测)。中止语义与 v3.10.6 完全一致:_fire_cancel 一被
+        #   set,当前这片 wait 立刻返回 True → 跳出 → 关激光 → 中止清理。
+        #   HIT_CHECK_ENABLE=False 或无瞄准点时退化为原版单次 wait,行为零差异。
+        _samples = []          # [(x, y)] 灼烧期间检到的蓝斑位置
+        _max_score_seen = 0    # 诊断:ROI 内 B−max(G,R) 峰值(调 BLUE_DOMINANCE_MIN 用)
+        if HIT_CHECK_ENABLE and _aim is not None:
+            _t_end = time.time() + FIRE_DURATION_SEC
+            cancelled = False
+            while True:
+                _remain = _t_end - time.time()
+                if _remain <= 0:
+                    break
+                if self._fire_cancel.wait(min(HIT_SAMPLE_PERIOD_SEC, _remain)):
+                    cancelled = True
+                    break
+                _frm = self._get_rgb()
+                if _frm is None:
+                    continue
+                try:
+                    _bs = find_blue_spot(_frm, int(_aim[0]), int(_aim[1]))
+                except Exception:
+                    _bs = None      # 判定挂了也绝不能影响点火序列
+                if _bs is not None:
+                    _samples.append((_bs[0], _bs[1]))
+                    _max_score_seen = max(_max_score_seen, _bs[2])
+        else:
+            cancelled = self._fire_cancel.wait(FIRE_DURATION_SEC)
         self._set_blue_laser(False)              # 永远先关激光
         if cancelled:
             self.get_logger().warn("⛔ 灼烧中收到中止 → 提前关激光，跳过收尾")
             self._cleanup_aborted_fire()
             return
+
+        # ── v3.11.2: 灼烧完毕,定命中判定(纯观测,只进日志/回报/网页) ──
+        #   三态:hit(中位蓝斑距瞄准点≤HIT_TOL_PX) / miss(检到了但偏出容差) /
+        #        unseen(检出帧不足 —— 相机看不见蓝斑,不冤枉打击链路)。
+        _hit = None; _hit_dist = None; _hit_frames = len(_samples)
+        if HIT_CHECK_ENABLE and _aim is not None:
+            if _hit_frames >= HIT_MIN_FRAMES:
+                _xs = sorted(p[0] for p in _samples)
+                _ys = sorted(p[1] for p in _samples)
+                _mx = _xs[len(_xs) // 2]
+                _my = _ys[len(_ys) // 2]
+                _hit_dist = ((_mx - _aim[0]) ** 2
+                             + (_my - _aim[1]) ** 2) ** 0.5
+                _hit = bool(_hit_dist <= HIT_TOL_PX)
+                _verdict = "hit" if _hit else "miss"
+                _hit_pos = {"x": int(_mx), "y": int(_my)}
+            else:
+                _verdict = "unseen"
+                _hit_pos = None
+            self._hit_stats[_verdict] += 1
+            # 整体赋值(引用原子交换),HTTP 线程只读 → 无竞态
+            self._last_hit = {
+                "id": self._strike_cmd_id, "verdict": _verdict,
+                "dist": (round(_hit_dist, 1) if _hit_dist is not None
+                         else None),
+                "pos": _hit_pos,
+                "aim": {"x": int(_aim[0]), "y": int(_aim[1])},
+                "frames": _hit_frames, "at": time.time(),
+            }
+            if _verdict == "hit":
+                self.get_logger().info(
+                    f"🎯 [HIT] 命中: 蓝斑中位({_hit_pos['x']},{_hit_pos['y']})"
+                    f" 距瞄准点 d={_hit_dist:.1f}px ≤ {HIT_TOL_PX:.0f}px"
+                    f"  ({_hit_frames} 帧检出, maxScore={_max_score_seen})")
+            elif _verdict == "miss":
+                self.get_logger().warn(
+                    f"❌ [HIT] 脱靶: 蓝斑中位({_hit_pos['x']},{_hit_pos['y']})"
+                    f" 距瞄准点 d={_hit_dist:.1f}px > {HIT_TOL_PX:.0f}px"
+                    f"  ({_hit_frames} 帧检出, maxScore={_max_score_seen})")
+            else:
+                self.get_logger().warn(
+                    f"❓ [HIT] 蓝斑未检出({_hit_frames} 帧 < {HIT_MIN_FRAMES},"
+                    f" maxScore={_max_score_seen}) —— 判定弃权,不算脱靶。"
+                    f" 若持续如此,按 README 降 BLUE_DOMINANCE_MIN 或核对曝光")
 
         self.get_logger().info(f"   蓝紫激光 OFF，冷却 {FIRE_COOLDOWN_SEC}s")
         self.fsm_state = STATE_COOLDOWN
@@ -2335,9 +3499,15 @@ class VisionServoNode(Node):
 
         # v3.10.4: 状态已置 IDLE 后再回报 success —— 避免 planner 收到结果即抢发
         #          下一条 strike_cmd 时本节点还在 COOLDOWN 而被拒。
-        if _sid is not None:
-            self._publish_strike_result(_sid, "success",
-                                        _stgt.get("x"), _stgt.get("y"), _sdist)
+        # v3.11.2: 附带命中判定(hit/hit_dist/hit_frames),planner 聚合进战报。
+        # v3.12.0: 不再限 _sid —— 手动打击也进作业统计(函数内 sid=None 只记账不回报)。
+        self._publish_strike_result(_sid, "success",
+                                    _stgt.get("x"), _stgt.get("y"), _sdist,
+                                    hit=_hit,
+                                    hit_dist=(round(_hit_dist, 1)
+                                              if _hit_dist is not None
+                                              else None),
+                                    hit_frames=_hit_frames)
 
     def _cleanup_aborted_fire(self):
         """v3.10.6: 点火序列被中止时的最小清理。
@@ -2467,6 +3637,45 @@ class VisionServoNode(Node):
                     else:
                         effective_yolo = node.yolo_target
                         target_frozen = False
+                    # ── v3.11.2: 决策叠加层的坐标平移量(纯显示) ──
+                    # planner 会话里的目标坐标是【中心参考系】;eye-in-hand 下云台
+                    # 一转全场同量平移。前端要把这些点画到当前画面上,需要一个平移:
+                    #   · 云台在中心 → 平移 (0,0),直接画(投票/建队期正是这时);
+                    #   · 伺服中且有 live 靶点 + 锁存中心参考坐标 → 平移 =
+                    #     靶点 − 锁存(与 _cb_yolo 身份核验用的是同一个量);
+                    #   · 其它情况 → null,前端不画叠加(只显示侧栏列表),不画错图。
+                    at_center = (abs(node.servo_yaw - SERVO_YAW_CENTER) <= 0.5
+                                 and abs(node.servo_pitch
+                                         - SERVO_PITCH_CENTER) <= 0.5)
+                    session_shift = None
+                    if at_center:
+                        session_shift = {"dx": 0, "dy": 0}
+                    elif (servoing and node.yolo_target is not None
+                          and node._locked_yolo_target is not None):
+                        session_shift = {
+                            "dx": node.yolo_target["x"]
+                                  - node._locked_yolo_target["x"],
+                            "dy": node.yolo_target["y"]
+                                  - node._locked_yolo_target["y"]}
+                    _lh = node._last_hit
+                    last_hit_age = ((now - _lh["at"])
+                                    if _lh is not None else None)
+                    _shots_snap = list(node._shots)   # v3.12.0: 快照隔离并发
+                    # v3.13.0: 健康序列快照 + 相对基线
+                    _hs = list(node._health_series)
+                    _health = None
+                    if _hs:
+                        _base = _hs[0][1]
+                        _cur = _hs[-1][1]
+                        _health = {
+                            "cur": _cur, "n_box": _hs[-1][2],
+                            "baseline": _base,
+                            "delta_pct": (round((_cur - _base) / _base * 100, 1)
+                                          if _base > 1e-6 else None),
+                            "series": [[t, v] for t, v, _ in _hs[-240:]],
+                        }
+                    psess_age = ((now - node._planner_session_at)
+                                 if node._planner_session_at > 0 else None)
                     self._send_json({
                         "trigger":   node.trigger_mode,
                         "loop_mode": node.loop_mode,
@@ -2488,8 +3697,8 @@ class VisionServoNode(Node):
                         "kp": node.kp, "ki": node.ki, "kd": node.kd,
                         "locked": node.lock_count >= PID_LOCK_FRAMES,
                         "fire_in_open_loop": node.fire_in_open_loop,
-                        "calib2_stale": node.calib2_stale,
-                        "calib2_frame": node.calib.calib2_frame,
+                        "calib2_stale": getattr(node.calib, 'calib2_frame', None) is not None and getattr(node.calib, 'calib2_frame', '') != 'rgb',
+                        "calib2_frame": getattr(node.calib, 'calib2_frame', 'rgb'),
                         "calib2_done":  node.calib.calib2_done,
                         "delta_x": node.calib.delta_x,
                         "delta_y": node.calib.delta_y,
@@ -2512,6 +3721,25 @@ class VisionServoNode(Node):
                         "pid_tuning_source":        node._pid_tuning_source,
                         # v3.10.1: YOLO 频率指令（让前端滑块加载时显示真实值）
                         "yolo_cmd_freq":            node.yolo_cmd_freq,
+                        # ── v3.11.2: 命中判定 + 决策会话(纯显示字段) ──
+                        "last_hit":          _lh,
+                        "last_hit_age_sec":  last_hit_age,
+                        "hit_stats":         node._hit_stats,
+                        "planner_session":   node._planner_session,
+                        "planner_session_age_sec": psess_age,
+                        "session_shift":     session_shift,
+                        "at_center":         at_center,
+                        # ── v3.12.0: 作业统计 ──
+                        "shots":             _shots_snap[-60:],
+                        "shot_stats":        compute_shot_stats(_shots_snap),
+                        "hit_tol_px":        HIT_TOL_PX,
+                        # ── v3.13.0: 任务面板 ──
+                        "chassis":           node._chassis_state,
+                        "chassis_age_sec":   ((now - node._chassis_state_at)
+                                              if node._chassis_state_at > 0
+                                              else None),
+                        "patch_history":     node._patch_history[-10:],
+                        "health":            _health,
                     })
                     return
 
@@ -2602,6 +3830,35 @@ class VisionServoNode(Node):
                         f"(ID={LASER_BLUE_ID}, angle={LASER_ON_ANGLE if on else 0})"
                     )
                     self._send_json({"ok": True, "blue": node.laser_blue_state})
+                    return
+
+                if path == "/api/mission_start":
+                    node.pub_ch_start.publish(Empty())
+                    node.get_logger().info("[任务] 网页发车 → /chassis/start")
+                    self._send_json({"ok": True}); return
+                if path == "/api/mission_stop":
+                    node.pub_ch_stop.publish(Empty())
+                    node.get_logger().info("[任务] 网页收工 → /chassis/stop")
+                    self._send_json({"ok": True}); return
+                if path == "/api/estop":
+                    # 双保险:广播全局急停 + 本地立即执行(不等自订阅回环)
+                    node.pub_safety.publish(Empty())
+                    try:
+                        node._cb_safety_stop(None)
+                    except Exception:
+                        pass
+                    node.get_logger().warn("[任务] 🛑 网页急停 → /safety_stop + 本地立停")
+                    self._send_json({"ok": True}); return
+
+                if path == "/api/stats_reset":
+                    # v3.12.0: 清零内存统计(演示开跑前按);磁盘 JSONL 不动
+                    with node._shot_lock:
+                        node._shots = []
+                        node._shots_n = 0
+                    node._hit_stats = {"hit": 0, "miss": 0, "unseen": 0}
+                    node._last_hit = None
+                    node.get_logger().info("[STATS] 作业统计已重置(网页触发)")
+                    self._send_json({"ok": True})
                     return
 
                 if path == "/api/fire_test":
@@ -2705,8 +3962,45 @@ class VisionServoNode(Node):
 
                 self.send_response(404); self.end_headers()
 
+            def do_POST(self):
+                """v3.14.0: ASR 语音识别端点。接收浏览器 MediaRecorder 音频 POST。"""
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length) if length > 0 else b""
+                path = self.path.split("?")[0]
+
+                if path == "/api/asr":
+                    if node.asr is None:
+                        self._send_json({"ok": False, "text": "",
+                                         "command": None,
+                                         "msg": "ASR 已被禁用"})
+                        return
+                    if not node.asr.available:
+                        self._send_json({"ok": False, "text": "",
+                                         "command": None,
+                                         "msg": ASR_DEV_MODE_MSG})
+                        return
+                    try:
+                        result = node.asr.recognize(body)
+                        node._asr_last_result = result
+                        self._send_json({
+                            "ok": True,
+                            "text": result.get("text", ""),
+                            "command": result.get("command"),
+                            "confidence": result.get("confidence", 0.0),
+                            "ms": result.get("ms", 0.0),
+                        })
+                    except Exception as e:
+                        node.get_logger().error(f"[ASR] 推理异常: {e}")
+                        self._send_json({"ok": False, "text": "",
+                                         "command": None, "msg": str(e)})
+                    return
+
+                self._send_json({"ok": False}, 404)
+
         def serve():
-            HTTPServer(("0.0.0.0", SERVO_HTTP_PORT), Handler).serve_forever()
+            server = HTTPServer(("0.0.0.0", SERVO_HTTP_PORT), Handler)
+            server.timeout = 0.5  # v3.14.0: 允许 POST body 完整接收
+            server.serve_forever()
 
         threading.Thread(target=serve, daemon=True).start()
 

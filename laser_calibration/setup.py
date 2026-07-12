@@ -6,7 +6,7 @@ package_name = 'laser_calibration'
 
 setup(
     name=package_name,
-    version='3.11.1',
+    version='3.13.0',
     packages=[package_name],
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -38,6 +38,8 @@ setup(
             'vision_servo  = laser_calibration.vision_servo:main',
             'yolo_detector = laser_calibration.yolo_detector:main',
             'strike_planner = laser_calibration.strike_planner:main',
+            'grid_calibration = laser_calibration.grid_calibration:main',
+            'analyze_strike_logs = laser_calibration.analyze_strike_logs:main',
             'chassis_controller = laser_calibration.chassis_controller:main',
         ],
     },

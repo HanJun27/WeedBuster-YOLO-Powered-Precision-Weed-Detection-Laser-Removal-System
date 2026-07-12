@@ -41,10 +41,24 @@ temp_extract/
 # 其他无关文档
 *.zip
 *.exe
+*.tar.bz2
+*.tar.gz
+*.whl
 md/
 视频/
 校准数据/
 总数据集/
+
+# ASR 模型文件
+paraformer-small/
+
+# SSH 临时文件
+ssh_askpass.*
+ssh_err.*
+ssh_out.*
+
+# 临时日志
+*.log
 
 # Node modules (如果有)
 node_modules/
