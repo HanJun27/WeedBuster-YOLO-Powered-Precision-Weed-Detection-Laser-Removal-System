@@ -11,12 +11,12 @@ echo 使用前请确保:
 echo   1. pip install faster-whisper
 echo   2. 已下载 faster-whisper 模型
 echo.
-echo 默认模型路径: ./models/faster-whisper-small
+echo 默认模型路径: ./语音模型
 echo 可在 8093 面板中选择模型路径并点击"加载"
 echo.
 
 cd /d %~dp0
-python laser_calibration\local_asr_server.py --model ./models/faster-whisper-small
+python laser_calibration\laser_calibration\local_asr_server.py --model ./语音模型
 
 if %ERRORLEVEL% NEQ 0 (
     echo.

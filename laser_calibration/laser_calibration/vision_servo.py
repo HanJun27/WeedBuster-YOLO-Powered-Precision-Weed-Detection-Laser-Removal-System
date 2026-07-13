@@ -959,14 +959,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <option value="local">💻 操作员端 faster-whisper</option>
   </select>
   <span id="local-asr-config" style="display:none;font-size:12px;color:#888">
-    模型:
-    <input type="text" id="model-path" placeholder="模型目录路径..."
-           style="background:#333;color:#0f0;border:1px solid #555;font-family:monospace;font-size:12px;width:200px">
-    <button class="btn" style="padding:2px 8px;font-size:11px" onclick="setLocalModel()">加载</button>
+    <button class="btn" style="padding:2px 8px;font-size:11px" onclick="browseAndLoadModel()">📂 选择模型目录</button>
+    <span id="model-path-display" style="font-size:11px;color:#888"></span>
     <span id="model-status" style="font-size:11px"></span>
   </span>
   <span>语音 <span id="asr-status" style="color:#888">就绪</span></span>
   <span id="asr-result" style="color:#fa0;font-size:13px"></span>
+  <button id="asr-log-btn" class="btn" style="padding:2px 8px;font-size:11px" onclick="toggleAsrLog()">📋 日志</button>
+</div>
+
+<!-- ASR 日志面板（隐藏，点击日志按钮展开） -->
+<div id="asr-log-panel" style="display:none;background:#111;border:1px solid #444;border-radius:4px;padding:8px;margin:4px 0;max-height:300px;overflow-y:auto;font-size:12px;font-family:monospace">
+  <div style="color:#0f0;margin-bottom:4px">ASR 识别日志 (最近 50 条)</div>
+  <div id="asr-log-content" style="color:#aaa;line-height:1.6"></div>
 </div>
 
 <div id="calib-banner" style="display:none; background:#600; color:#fff; padding:10px 14px;
@@ -1830,33 +1835,40 @@ let recordTimer = null;
 let selectedDeviceId = '';
 let ASR_BACKEND = 'rdk';  // 'rdk' | 'local'
 const LOCAL_ASR_URL = 'http://127.0.0.1:8094';
+let asrLogs = [];  // ASR 识别历史日志
+const ASR_LOG_MAX = 50;
 
 // 枚举麦克风设备并填充下拉框（先请求权限以获取设备标签）
 function loadMicList() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
-  // 静默请求权限，确保设备标签可用
+  // 先请求权限，再枚举设备（确保获取到设备名称标签）
+  var doEnum = function() {
+    navigator.mediaDevices.enumerateDevices().then(devices => {
+      var sel = document.getElementById('mic-select');
+      if (!sel) return;
+      var audioInputs = devices.filter(function(d) { return d.kind === 'audioinput'; });
+      if (audioInputs.length === 0) {
+        sel.innerHTML = '<option value="">(无麦克风)</option>';
+        return;
+      }
+      var prevVal = sel.value;
+      sel.innerHTML = audioInputs.map(function(d, i) {
+        var label = d.label || ('麦克风 ' + (i + 1));
+        return '<option value="' + d.deviceId + '">' + label + '</option>';
+      }).join('');
+      if (prevVal && Array.from(sel.options).some(function(o) { return o.value === prevVal; })) {
+        sel.value = prevVal;
+      }
+      selectedDeviceId = sel.value;
+    }).catch(function() {});
+  };
+  // 先请求权限，确保标签可用
   navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
     stream.getTracks().forEach(function(t) { t.stop(); });
-  }).catch(function() {});
-  navigator.mediaDevices.enumerateDevices().then(devices => {
-    var sel = document.getElementById('mic-select');
-    if (!sel) return;
-    var audioInputs = devices.filter(function(d) { return d.kind === 'audioinput'; });
-    if (audioInputs.length === 0) {
-      sel.innerHTML = '<option value="">(无麦克风)</option>';
-      return;
-    }
-    var prevVal = sel.value;
-    sel.innerHTML = audioInputs.map(function(d, i) {
-      var label = d.label || ('麦克风 ' + (i + 1));
-      return '<option value="' + d.deviceId + '">' + label + '</option>';
-    }).join('');
-    // 恢复上次选中的设备，否则默认第一个
-    if (prevVal && Array.from(sel.options).some(function(o) { return o.value === prevVal; })) {
-      sel.value = prevVal;
-    }
-    selectedDeviceId = sel.value;
-  }).catch(function() {});
+    doEnum();
+  }).catch(function() {
+    doEnum();  // 权限被拒也能枚举，只是无标签
+  });
 }
 
 function onMicChange() {
@@ -1884,30 +1896,78 @@ function onAsrBackendChange() {
   }
 }
 
-function setLocalModel() {
-  var path = document.getElementById('model-path').value;
-  if (!path) { alert('请输入模型路径'); return; }
+function browseAndLoadModel() {
   var sts = document.getElementById('model-status');
-  sts.textContent = '加载中...';
+  var display = document.getElementById('model-path-display');
+  sts.textContent = '打开选择器...';
   sts.style.color = '#fa0';
-  fetch(LOCAL_ASR_URL + '/model', {
+  // 第一步：调用本地服务的系统文件夹选择器
+  fetch(LOCAL_ASR_URL + '/browse', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: path }),
-    signal: AbortSignal.timeout(60000)  // 模型加载可能较慢
+    signal: AbortSignal.timeout(30000)
   }).then(function(r) { return r.json(); }).then(function(d) {
-    if (d.ok && d.loaded) {
-      sts.textContent = '✅ ' + d.size + ' 已加载';
-      sts.style.color = '#0f0';
-      document.getElementById('asr-status').textContent = '本地 ✅';
-    } else {
-      sts.textContent = '❌ ' + (d.error || '加载失败');
+    if (!d.ok || !d.path) {
+      sts.textContent = '❌ ' + (d.error || '取消选择');
       sts.style.color = '#f55';
+      return;
     }
+    var path = d.path;
+    display.textContent = path;
+    display.style.color = '#888';
+    // 第二步：自动加载选中的模型
+    sts.textContent = '加载中...';
+    sts.style.color = '#fa0';
+    fetch(LOCAL_ASR_URL + '/model', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: path }),
+      signal: AbortSignal.timeout(60000)
+    }).then(function(r2) { return r2.json(); }).then(function(d2) {
+      if (d2.ok && d2.loaded) {
+        sts.textContent = '✅ ' + d2.size + ' 已加载';
+        sts.style.color = '#0f0';
+        document.getElementById('asr-status').textContent = '本地 ✅';
+      } else {
+        sts.textContent = '❌ ' + (d2.error || '加载失败');
+        sts.style.color = '#f55';
+      }
+    }).catch(function(err) {
+      sts.textContent = '❌ 加载失败: ' + err.message;
+      sts.style.color = '#f55';
+    });
   }).catch(function(err) {
     sts.textContent = '❌ 连接失败: ' + err.message;
     sts.style.color = '#f55';
   });
+}
+
+// 切换 ASR 日志面板显隐
+function toggleAsrLog() {
+  var panel = document.getElementById('asr-log-panel');
+  if (!panel) return;
+  var isHidden = (panel.style.display === 'none' || !panel.style.display);
+  panel.style.display = isHidden ? 'block' : 'none';
+  if (isHidden) renderAsrLog();
+}
+
+// 渲染 ASR 日志
+function renderAsrLog() {
+  var el = document.getElementById('asr-log-content');
+  if (!el) return;
+  if (asrLogs.length === 0) {
+    el.innerHTML = '<span style="color:#666">(暂无日志 — 按住🎤开始识别)</span>';
+    return;
+  }
+  el.innerHTML = asrLogs.slice().reverse().map(function(log) {
+    var col = log.command ? '#0f0' : '#fa0';
+    return '<div>' +
+      '<span style="color:#666">[' + log.time + ']</span> ' +
+      '<span style="color:#fff">"' + log.text + '"</span> ' +
+      (log.command ? '<span style="color:' + col + '">→ ' + log.command + '</span>' : '<span style="color:#888">(未匹配)</span>') +
+      ' <span style="color:#555">' + log.ms + 'ms</span>' +
+      ' <span style="color:#555">[' + log.backend + ']</span>' +
+      '</div>';
+  }).join('');
 }
 
 function startRecord() {
@@ -2031,6 +2091,17 @@ function sendAudio() {
     fetch(url, { method: 'POST', body: wavBlob })
       .then(function(r) { return r.json(); })
       .then(function(d) {
+        // 记录 ASR 日志
+        var logEntry = {
+          time: new Date().toLocaleTimeString(),
+          text: d.text || '',
+          command: d.command || null,
+          ms: d.ms || 0,
+          backend: ASR_BACKEND === 'rdk' ? 'RDK' : '本地'
+        };
+        asrLogs.push(logEntry);
+        if (asrLogs.length > ASR_LOG_MAX) asrLogs.shift();
+
         if (d.ok && d.text) {
           document.getElementById('asr-result').textContent = '「' + d.text + '」';
           if (d.command) {

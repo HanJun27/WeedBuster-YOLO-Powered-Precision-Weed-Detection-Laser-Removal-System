@@ -18,6 +18,7 @@ local_asr_server.py —— 操作员端 faster-whisper 本地 ASR 服务  v3.14.
     GET  /health      → {"ok": true, "model_loaded": bool}
     GET  /model       → {"path": str, "loaded": bool, "size": str}
     POST /model       → {"path": "..."}  设置模型路径并加载
+    POST /browse      → {"path": "..."}  弹出系统文件夹选择器，返回选中路径
     POST /transcribe  → WAV 音频 body → {"text": str, "ok": bool}
 """
 
@@ -28,6 +29,8 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Lock
+import tkinter as tk
+from tkinter import filedialog
 
 
 # ── 全局模型状态（跨请求共享） ──────────────────────────────────
@@ -131,6 +134,21 @@ class AsrHandler(BaseHTTPRequestHandler):
                 else:
                     self._json({"ok": False, "loaded": False, "error": info})
 
+        elif path == "/browse":
+            """弹出系统文件夹选择器，返回用户选择的路径。"""
+            try:
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                folder = filedialog.askdirectory(title="选择 faster-whisper 模型目录")
+                root.destroy()
+                if folder:
+                    self._json({"ok": True, "path": folder})
+                else:
+                    self._json({"ok": False, "error": "未选择目录"})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+
         elif path == "/transcribe":
             if _model is None:
                 self._json({"ok": False, "text": "", "error": "模型未加载"})
@@ -181,7 +199,7 @@ class AsrHandler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(
         description="本地 faster-whisper ASR 服务 :8094")
-    parser.add_argument("--model", "-m", default="./models/faster-whisper-small",
+    parser.add_argument("--model", "-m", default="./语音模型",
                         help="faster-whisper 模型路径")
     parser.add_argument("--port", "-p", type=int, default=8094,
                         help="监听端口 (默认 8094)")
@@ -204,6 +222,7 @@ def main():
     log(f"    GET  /health      — 健康检查")
     log(f"    GET  /model       — 当前模型状态")
     log(f"    POST /model       — 设置模型路径并重新加载")
+    log(f"    POST /browse      — 打开系统文件夹选择器")
     log(f"    POST /transcribe  — WAV 音频识别")
     try:
         server.serve_forever()
