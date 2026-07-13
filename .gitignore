@@ -51,6 +51,7 @@ md/
 
 # ASR 模型文件
 paraformer-small/
+语音模型/
 
 # SSH 临时文件
 ssh_askpass.*
